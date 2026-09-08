@@ -1,0 +1,122 @@
+{
+  "_": "What agent-seam publishes and how a consumer cuts it. Read here by python/test_closure.py and tools/check-manifest.mjs; read by a consumer's vendor script at vendor time and never at its test time (a consumer's tests run on the digests in its own VENDOR.json). The contract is spec/seam.md + vectors/; each implementation directory re-derives the vectors.",
+  "jsRegion": {
+    "_": "js/seam.mjs. `start`..`end` (exclusive) is the block the door carries verbatim between its own CANONICAL JSON banner and its `reach-back through a relay` banner; `pinnedMarker`..`start` holds the declarations the door carries verbatim outside that block, matched by name. `sections` are the `// ==== title` banners inside the block, in order; `minLines` is a floor against a mangled banner collapsing the region to nothing.",
+    "start": "^// =+ CANONICAL JSON$",
+    "end": "^// ---- end of the seam$",
+    "pinnedMarker": "^// ---- pinned:",
+    "sections": [
+      "CANONICAL JSON",
+      "Ed25519 (node:crypto)",
+      "base58btc + did:key",
+      "the signing envelope",
+      "KeyState (inline op-key, T142 A2)",
+      "Web Bot Auth (RFC 9421 subset, verify-only) — T107",
+      "device-key binding v2 (T102)",
+      "signed Agent Card envelope",
+      "cryptobox (X25519 + ChaCha20)"
+    ],
+    "minLines": 900,
+    "pinnedDeclarations": [
+      "PROTOCOL_VERSION",
+      "MAX_TEXT_BYTES",
+      "MAX_BODY_BYTES",
+      "CLOCK_WINDOW_S",
+      "REPLAY_TTL_S",
+      "CARD_SIG_REFRESH_S",
+      "AGENT_CARD_PATH",
+      "AGENT_CARD_PATH_LEGACY",
+      "AGENT_CARD_SIG_PATH",
+      "SIGNED_ENVELOPE_SCHEME",
+      "AGENT_ENTRY_REL",
+      "ERRORS",
+      "asciiLower",
+      "CARD_ENVELOPE_VERSION",
+      "CARD_ENVELOPE_TYPE"
+    ]
+  },
+  "python": {
+    "_": "python/shared/ is the slice; `verbatimTests` travel with it unchanged into a consumer; `homeTests` exist here in a form that needs no node or relay (core keeps its own variants); `forbiddenImports` is what the closure test refuses.",
+    "modules": [
+      "cardpub",
+      "crypto",
+      "cryptobox",
+      "domainbind",
+      "gateway",
+      "httpua",
+      "httputil",
+      "invite",
+      "jws",
+      "keybinding",
+      "keystate",
+      "neturl",
+      "ownerstate",
+      "peercompat",
+      "protocol",
+      "vc",
+      "version",
+      "webbotauth"
+    ],
+    "verbatimTests": [
+      "test_keybinding.py",
+      "test_cryptobox.py",
+      "test_gateway.py",
+      "test_neturl_origin.py"
+    ],
+    "homeTests": [
+      "test_wire_vectors.py",
+      "test_webbotauth.py",
+      "tools/gen_wba_vectors.py"
+    ],
+    "forbiddenImports": [
+      "agent",
+      "relay",
+      "relay_proxy",
+      "tools",
+      "examples"
+    ]
+  },
+  "vectors": [
+    "wba_vectors.json",
+    "wire_vectors.json"
+  ],
+  "implementations": [
+    {
+      "lang": "js",
+      "dir": "js",
+      "run": "node js/conformance/run.mjs",
+      "groups": [
+        "canonical",
+        "did",
+        "envelope",
+        "reject.message",
+        "cardpub",
+        "cryptobox",
+        "bindingV2",
+        "webBotAuth(wba_vectors)"
+      ]
+    },
+    {
+      "lang": "python",
+      "dir": "python",
+      "run": "python3 python/test_wire_vectors.py",
+      "groups": [
+        "canonical",
+        "numberHazards",
+        "did",
+        "envelope",
+        "binding",
+        "bindingV2",
+        "ownerState",
+        "relay",
+        "cryptobox",
+        "invite",
+        "cardpub",
+        "domainLinkage",
+        "webBotAuth",
+        "reject",
+        "webBotAuth(wba_vectors)"
+      ]
+    }
+  ]
+}

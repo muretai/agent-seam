@@ -1,0 +1,32 @@
+{
+  "name": "@muretai/agent-seam",
+  "version": "0.2.1",
+  "private": true,
+  "description": "The seam of Agent Entry — the wire contract every implementation must reproduce: canonical JSON, did:key, the six signed fields, card envelopes, device binding, Web Bot Auth verify, cryptobox — as golden vectors plus reference implementations in JS and Python. Zero dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Muretai",
+  "exports": {
+    ".": "./js/seam.mjs",
+    "./vectors/wire_vectors.json": "./vectors/wire_vectors.json",
+    "./vectors/wba_vectors.json": "./vectors/wba_vectors.json",
+    "./tools/manifest.json": "./tools/manifest.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "js/",
+    "vectors/",
+    "spec/",
+    "tools/manifest.json",
+    "LICENSE",
+    "README.md",
+    "PROVENANCE.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node tools/check-manifest.mjs && node js/conformance/run.mjs",
+    "test:py": "python3 python/test_closure.py && python3 python/test_wire_vectors.py && python3 python/test_webbotauth.py && python3 python/test_keybinding.py && python3 python/test_cryptobox.py && python3 python/test_gateway.py && python3 python/test_neturl_origin.py"
+  }
+}
