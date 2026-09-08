@@ -9,7 +9,10 @@
 //! float spelled two ways, an integer that rounds. Nothing throws; the signature simply stops
 //! verifying and the only diagnostic anyone gets is "signature verification failed".
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+// `Verifier` (the trait behind the permissive `verify`) is deliberately NOT imported:
+// verification here goes through the inherent `verify_strict`, and leaving the trait out
+// means a future edit cannot reach for the permissive check by accident.
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
 use std::fmt::Write as _;
 
@@ -75,6 +78,27 @@ fn encode_value(out: &mut String, v: &Value) -> Result<(), String> {
 /// Matches `json.dumps(ensure_ascii=False)`: the short escapes Python uses, a lowercase
 /// `\u00xx` for the remaining control characters, and everything else literal — including
 /// `/`, DEL and every non-ASCII character.
+///
+/// NO UTF-8 GUARD HERE, AND NOT BECAUSE IT DOES NOT MATTER. The Go reference needs one and
+/// carries an explicit parser for it: `encoding/json` REPAIRS an unpaired `\uD800`–`\uDFFF`
+/// escape to U+FFFD on the way in, so `{"s":"\ud800"}` and `{"s":"\ufffd"}` become one
+/// document and sign one identical byte string. Rust cannot reach that state: a `&str` is
+/// UTF-8 by construction and cannot hold a lone surrogate, and `serde_json` refuses the
+/// escape at the parse boundary rather than repairing it — measured, on every spelling:
+/// lone high, lone low, either one inside a KEY, a reversed pair, a high followed by a
+/// literal astral character, by plain text, by end-of-string, and by a second high; plus
+/// raw invalid UTF-8 bytes through `from_slice`. All refused. A legitimate literal U+FFFD
+/// and a well-formed pair still parse and encode, which is the half that must not break —
+/// all four references canonicalize those and refusing them here would trade one split for
+/// another.
+///
+/// BUT THAT VERDICT IS THE CRATE'S, NOT THIS FILE'S. Nothing in the seam states it, no
+/// vector pins it, and a dependency's behaviour that nothing pins is a verdict that can
+/// move under you between two minor versions — the same argument that made `verify_strict`
+/// and SMALL_ORDER_PUBLIC_KEYS worth writing down. There is nothing to guard against here
+/// today, so there is no code; if `serde_json` ever starts repairing instead of refusing,
+/// this is the comment that says where to look, and the fix is Go's: a check at the parse
+/// boundary, never in this function.
 fn encode_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -203,9 +227,16 @@ pub fn did_from_public_key(pub_key: &[u8]) -> Result<String, String> {
     Ok(format!("did:key:z{}", b58_encode(&buf)))
 }
 
-/// The other direction, and where a verifier must go: a message names its sender in `from`,
-/// and the verifying key is derived FROM that name rather than taken from anything the
-/// message also carries.
+/// The other direction: the CODEC, and nothing more. It answers "what 32 bytes does this
+/// DID spell?", byte for byte, including spellings no honest key generator would ever
+/// produce — `vectors/wire_vectors.json` pins the round trip for `00..00` (a point of
+/// order 4) and `ff..ff` (the non-canonical spelling of y = 18), and all four references
+/// must reproduce both. The JavaScript reference draws the line in the same place:
+/// `publicKeyHexFromDid` decodes anything, and `node:crypto` does the refusing inside
+/// verify.
+///
+/// So a VERIFIER must not stop here — use [`verifying_key_from_did`], which is this plus
+/// the refusal below.
 pub fn public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     let rest = did
         .strip_prefix("did:key:z")
@@ -216,6 +247,200 @@ pub fn public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&raw[2..]);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- small-order keys
+
+/// THE ONE BLOB THAT AUTHENTICATES EVERYTHING. Ed25519's group has a cofactor of 8: eight
+/// points sit outside the prime-order subgroup, with orders 1, 2, 4 and 8. Take the one of
+/// order 1 — the identity, encoded as `0x01` followed by 31 zero bytes — and publish it as
+/// your `did:key`. It renders as a perfectly ordinary DID. But verification asks whether
+/// `[S]B == R + [h]A`, and when `A` is the identity, `[h]A` is the identity for EVERY
+/// scalar `h`. So `R` = the identity, `S` = 0 satisfies the equation over ANY message. The
+/// attacker needs no private key and never had one: one DID and one constant 64-byte blob
+/// authenticate every message they will ever send, to everyone, forever. The other seven
+/// torsion points are the same class of problem with more arithmetic in front of them.
+///
+/// `verify_strict` already refuses these, and it is what [`Envelope::verify_signature`]
+/// calls. This table is here anyway, for the reason the crate header gives: a reader
+/// should be able to follow the whole path from a public key to a signature without
+/// leaving this file, and "the dependency handles it" is exactly the sentence that stops
+/// being true one minor version later, silently, in the one place where silence is the
+/// whole problem. It is also what makes the Go and Rust references literally the same
+/// refusal rather than two refusals that happen to agree today.
+///
+/// FOURTEEN ENCODINGS, NOT EIGHT. Seven spellings of y, each with the sign bit clear or
+/// set. Where x = 0 (y = 0 and y = q-1) the sign bit is simply a second spelling of one
+/// point, and a permissive decoder accepts both. y = q and y = q+1 are the non-canonical
+/// spellings of y = 0 and y = 1: they fit in 255 bits only because `2**255 - q == 19`,
+/// which is also why no other point on this curve has a second spelling worth listing.
+/// This is libsodium's blocklist, re-derived here from curve arithmetic — every entry
+/// decompressed, checked to be on the curve, and checked to satisfy `[8]P == identity` —
+/// rather than copied from memory. Do not edit an entry without redoing that.
+pub const SMALL_ORDER_PUBLIC_KEYS: [[u8; 32]; 14] = [
+    hex32("0000000000000000000000000000000000000000000000000000000000000000"), // order 4:  y = 0, x = sqrt(-1)
+    hex32("0000000000000000000000000000000000000000000000000000000000000080"), // order 4:  y = 0, x = -sqrt(-1) — a different point, not a second spelling
+    hex32("0100000000000000000000000000000000000000000000000000000000000000"), // order 1:  THE IDENTITY. This is the key the whole comment above is about.
+    hex32("0100000000000000000000000000000000000000000000000000000000000080"), // order 1:  the identity again, sign bit set over x = 0 — a second spelling of one point
+    hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"), // order 8
+    hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"), // order 8:  same y, other x
+    hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"), // order 8:  y = q minus the y above
+    hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"), // order 8:  same y, other x
+    hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // order 2:  y = q-1, x = 0
+    hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), // order 2:  y = q-1, sign bit set over x = 0 — a second spelling
+    hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // order 4:  y = q, the NON-CANONICAL spelling of y = 0
+    hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), // order 4:  y = q, sign bit set
+    hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // order 1:  y = q+1, the NON-CANONICAL spelling of the identity
+    hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), // order 1:  y = q+1, sign bit set
+];
+
+/// Parses one table entry at COMPILE time, so a mistyped digit above is a build failure
+/// rather than a hole in the only thing standing between this reference and a universal
+/// forgery.
+const fn hex32(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        panic!("small-order table: an entry is not 64 hex digits");
+    }
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = nybble(b[i * 2]) * 16 + nybble(b[i * 2 + 1]);
+        i += 1;
+    }
+    out
+}
+
+const fn nybble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => panic!("small-order table: not a lowercase hex digit"),
+    }
+}
+
+/// Whether `pk` is one of the fourteen encodings above — a key under which a single
+/// constant signature verifies over every message. A plain scan, not a constant-time one,
+/// and deliberately: a public key is public, and the answer leaks nothing an attacker did
+/// not choose themselves.
+pub fn is_small_order_public_key(pk: &[u8]) -> bool {
+    SMALL_ORDER_PUBLIC_KEYS.iter().any(|k| k == pk)
+}
+
+/// The ingress every verifier must use: [`public_key_from_did`] plus the refusal. Split
+/// from the codec on purpose — the codec has to spell anything, because the `did` vectors
+/// pin encodings a verifier must never accept — and this is the only door in this file
+/// from a DID to bytes that are about to answer a signature question.
+pub fn verifying_key_from_did(did: &str) -> Result<[u8; 32], String> {
+    let pk = public_key_from_did(did)?;
+    if is_small_order_public_key(&pk) {
+        return Err(format!(
+            "did:key: {did} is a small-order point — one signature verifies under it over every message, so it names nobody"
+        ));
+    }
+    Ok(pk)
+}
+
+// ---------------------------------------------------------------- the signature field
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64, written here rather than taken as a third crate — twenty lines, and it
+/// is needed for the re-encoding check below, which is the whole rule.
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Reads the base64 a signature arrives in and demands that it have exactly ONE spelling.
+/// The rule is character for character the one `js/seam.mjs` applies in `strictB64` and the
+/// one `shared/` applies in its `_b64_sig` helpers; whichever side is more permissive
+/// becomes the split, so it is written out here rather than delegated.
+///
+///  1. the standard alphabet and nothing else — `^[A-Za-z0-9+/]*={0,2}$`, so `-` and `_`
+///     are refused and padding can only be the trailing one or two characters;
+///  2. length a multiple of 4;
+///  3. decode, RE-ENCODE, and demand the input back character for character.
+///
+/// THE THIRD RULE IS THE ONLY ONE THAT SAYS CANONICAL, and the first two look total without
+/// it. A 64-byte signature is 88 characters ending `==`; its last data character carries 6
+/// bits of which the decoder reads 2 and DISCARDS 4, so all 16 characters sharing those top
+/// 2 bits decode to the identical 64 bytes. `…BQ==` through `…Bf==` are ONE signature under
+/// SIXTEEN names. One `=` discards 2 bits: a family of 4.
+///
+/// This replaces a hand-rolled decoder in the conformance runner that did `continue` on any
+/// character outside the alphabet — the most permissive of the four references, silently
+/// discarding junk the way `Buffer.from` and a bare `b64decode` used to. A rule that lives
+/// in a test is not part of the contract, which is why it is here and the runner calls it.
+///
+/// It does NOT check the length of the decoded bytes: that belongs where it already is, in
+/// [`Envelope::verify_signature`], and keeping this about the SPELLING alone lets one rule
+/// cover every base64 field the contract compares by identity.///
+/// WHY THIS RULE IS FOR BASE64 AND NOT FOR `did:key`. base64 has a degeneracy base58 does
+/// not: the trailing bits of a padded string are unconstrained, so one byte string has a
+/// family of names. `did:key` is base58 over a big integer, which is unique once the byte
+/// length is fixed — and [`public_key_from_did`] fixes it at 34, with a leading `0xed` that
+/// can never be a leading zero byte, so no leading `1` survives either. Measured rather
+/// than assumed: 2798 alternate spellings of one DID, and not one decoded to the same key.
+/// So the rule is drawn where the degeneracy actually is, and nowhere else.
+pub fn decode_signature(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 4 != 0 {
+        return Err(format!(
+            "signature: base64 length {} is not a multiple of 4",
+            s.len()
+        ));
+    }
+    let body = s.trim_end_matches('=');
+    if s.len() - body.len() > 2 {
+        return Err(format!(
+            "signature: {s:?} has more than two padding characters"
+        ));
+    }
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out: Vec<u8> = Vec::with_capacity(s.len() / 4 * 3);
+    for c in body.bytes() {
+        let Some(i) = B64.iter().position(|&a| a == c) else {
+            return Err(format!(
+                "signature: {:?} is not in the standard base64 alphabet",
+                c as char
+            ));
+        };
+        acc = (acc << 6) | i as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    let canon = b64_encode(&out);
+    if canon != s {
+        return Err(format!(
+            "signature: {s:?} is not the canonical base64 of the bytes it decodes to — that is \
+             {canon:?}, and the difference is the trailing bits no decoder reads"
+        ));
+    }
     Ok(out)
 }
 
@@ -260,7 +485,7 @@ impl Envelope {
         if self.from.is_empty() || sig.len() != 64 {
             return false;
         }
-        let Ok(pk) = public_key_from_did(&self.from) else {
+        let Ok(pk) = verifying_key_from_did(&self.from) else {
             return false;
         };
         let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
@@ -271,7 +496,16 @@ impl Envelope {
         };
         let mut raw = [0u8; 64];
         raw.copy_from_slice(sig);
-        vk.verify(payload.as_bytes(), &Signature::from_bytes(&raw))
+        // verify_strict, NOT verify. `verify` is dalek's legacy-compatible check — the
+        // permissive RFC 8032 equation, kept because "one doesn't simply get to change the
+        // definition of a cryptographic primitive ten years after-the-fact". It accepts a
+        // small-order public key, and with it the constant blob that authenticates every
+        // message (see SMALL_ORDER_PUBLIC_KEYS). verify_strict is the check RFC 8032 §5.1.7
+        // and "Taming the Many EdDSAs" recommend: it refuses a small-order A *and* a
+        // small-order R, so a signature is malleable neither in the key nor in the nonce.
+        // node:crypto refuses the same keys, which is the point — this line is what makes
+        // the Rust reference answer a forged blob the way the JavaScript one does.
+        vk.verify_strict(payload.as_bytes(), &Signature::from_bytes(&raw))
             .is_ok()
     }
 

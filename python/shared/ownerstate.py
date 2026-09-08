@@ -47,7 +47,6 @@ exists and degrades to False — never an exception — where it does not.
 
 from __future__ import annotations
 
-import base64
 from typing import Any, Callable
 
 from shared import crypto
@@ -217,10 +216,15 @@ def verify_ownerstate(rec: Any, expected_root_did: str | None = None) -> bool:
     root = rec["rootDid"]
     if expected_root_did is not None and root != expected_root_did:
         return False
-    try:
-        sig = base64.b64decode(rec["sig"])
-    except Exception:
+    sig = crypto.b64_strict(rec.get("sig"))
+    if sig is None:
         return False
+    # No LENGTH bound: the owner root may be P-256 (the docstring above says so, and
+    # `crypto.p256_verify` takes ASN.1 DER of ~70-72 bytes as readily as raw r||s), and a
+    # wrong-length Ed25519 signature is refused by `crypto.verify` on the next line anyway.
+    # `crypto.b64_strict` never raises, so the `try` that stood here has nothing left to
+    # catch -- `_payload` was always OUTSIDE it, and `_well_formed` has already vouched
+    # for every field it canonicalizes.
     return crypto.verify(root, sig, _payload(rec))
 
 

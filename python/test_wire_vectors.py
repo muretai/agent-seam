@@ -54,6 +54,12 @@ from shared.protocol import PROTOCOL_VERSION       # noqa: E402
 # committed file without touching it.
 VECTORS = Path(os.environ.get("AGENT_SEAM_VECTORS") or REPO.parent / "vectors" / "wire_vectors.json")
 
+#: U+FFFD REPLACEMENT CHARACTER, spelled as an escape. It is written this way in the two places
+#: `reject.encoding` reasons about it because the whole group turns on the difference between a
+#: document that CARRIES this character and a document that a repairing reader turned INTO it —
+#: and a literal glyph in the source is the one form a reader cannot tell from mojibake.
+_FFFD = "\ufffd"
+
 _passed = 0
 
 
@@ -424,6 +430,35 @@ def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+#: The standard base64 alphabet, in index order — the table `_trailing_bit_sibling` walks.
+_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def _trailing_bit_sibling(sig_b64: str) -> str:
+    """A SECOND spelling of the identical 64 signature bytes: one character different, in the
+    last data position, and nothing else.
+
+    88 characters ending "==" is 86 data characters carrying 516 bits for a 512-bit signature,
+    so the final data character (index 85) holds six bits of which a decoder reads two and
+    DISCARDS four. All sixteen characters sharing those top two bits decode to the same 64
+    bytes, and every one of them is well-formed standard base64: the alphabet test passes, the
+    length test passes, `base64.b64decode(..., validate=True)` accepts it, and the signature it
+    decodes to is the genuine one. Only the RE-ENCODE leg of `crypto.b64_strict` — and of the
+    JavaScript `strictB64`, Go `DecodeSignature`, Rust `decode_signature` — can tell this string
+    from the honest one, which is why the vector it feeds is the one case in `reject.message`
+    that looks completely well-formed.
+
+    Deterministic on purpose: the sibling is picked by flipping the low bit of the four
+    discarded bits, so `--regen` writes the same character every run."""
+    assert len(sig_b64) == 88 and sig_b64.endswith("=="), sig_b64
+    v = _B64_ALPHABET.index(sig_b64[85])
+    sibling = sig_b64[:85] + _B64_ALPHABET[(v & 0b110000) | ((v & 0b001111) ^ 1)] + "=="
+    assert sibling != sig_b64, "the sibling must be a DIFFERENT string"
+    assert base64.b64decode(sibling) == base64.b64decode(sig_b64), "…of ONE signature"
+    assert crypto.b64_strict(sibling) is None, "the strict reader must refuse the sibling"
+    return sibling
+
+
 class _SeedIdentity:
     """The minimal Identity surface the signing helpers need — `did` + `sign_bytes` — over a
     FIXED seed.
@@ -523,26 +558,58 @@ def _cryptobox_cases() -> dict:
     exactly what the round-trip check caught the first time this was written. A golden vector is a
     constant. They were produced once by core's `seal()`, and `test_cryptobox_vectors_actually_open`
     re-opens each one with core's real opener, so they cannot rot into fiction that only agrees
-    with itself."""
+    with itself.
+
+    THE ASSOCIATED DATA IS PART OF THE BLOB, and `with-associated-data` plus its `mustNotOpen`
+    twin are what say so. `ad` is authenticated but not encrypted, so it never appears in the
+    ciphertext and a client that drops it still sees a well-formed base64 blob of the right
+    length — it simply gets None, with nothing to point at. Worse is the other direction: an
+    implementation that quietly opens with the empty `ad` when it was given one, or that ignores
+    a mismatch, has unbound the context the sealer paid for. The twin is the SAME blob under a
+    different `ad`, so the only difference between "opens" and "must not open" is the value the
+    caller supplies. `adHex` is on every case, including the three that carry no associated data,
+    so that a runner cannot default the field into existence by forgetting it."""
     from shared import cryptobox
     a_seed, b_seed = bytes([3] * 32), bytes([9] * 32)
     return {
         "senderSeed": a_seed.hex(), "senderEncPub": cryptobox.enc_pub_hex(a_seed),
         "recipientSeed": b_seed.hex(), "recipientEncPub": cryptobox.enc_pub_hex(b_seed),
-        "note": "open_box(recipientSeed, senderEncPub, blob) == plaintext. seal() is NOT pinned — "
-                "it uses a random nonce, so its output is not reproducible. A client proves that "
-                "direction with its own round-trip against core; this pins the direction that "
-                "matters, that a client can OPEN what core sealed.",
+        "note": "open_box(recipientSeed, senderEncPub, blob, ad) == plaintext, where `ad` is the "
+                "bytes of `adHex` (empty for most cases). seal() is NOT pinned — it uses a random "
+                "nonce, so its output is not reproducible. A client proves that direction with "
+                "its own round-trip against core; this pins the direction that matters, that a "
+                "client can OPEN what core sealed. `mustNotOpen` is the same blob under the wrong "
+                "associated data and must return the implementation's no-plaintext answer (None / "
+                "null), never a partial read and never a throw.",
         "open": [
-            {"name": "plain",
+            {"name": "plain", "adHex": "",
              "blob": "YYrXndd8212cUzJ2A+sWWspUASAfIn2ipMdHcTh3y+Ir",
              "plaintextHex": "68656c6c6f"},
-            {"name": "non-ascii",
+            {"name": "non-ascii", "adHex": "",
              "blob": "58o9qnvehBofRDrqZH+xfU+SdmLFB7AlKQt1o0U6bsIWapNjAu5xmA==",
              "plaintextHex": "e7bea4e3828ce3819fe38184"},
-            {"name": "empty",
+            {"name": "empty", "adHex": "",
              "blob": "Aj7TqCyAdxO3dtdcJ8848Omz3oxT7o2N0mdQSw==",
              "plaintextHex": ""},
+            # ad = b"contextId=c1". Sealed once by shared/cryptobox.seal(..., ad=…) and frozen,
+            # for the random-nonce reason the docstring gives.
+            {"name": "with-associated-data", "adHex": "636f6e7465787449643d6331",
+             "blob": "913KMvf6CCFl+zO9szmWZNGHm97V409qLjkyuVqOQ/VAlchO2CSBwn9vOg==",
+             "plaintextHex": "7061792074686520696e766f696365"},
+        ],
+        "mustNotOpen": [
+            {"name": "associated-data-mismatch", "adHex": "636f6e7465787449643d6332",
+             "blob": "913KMvf6CCFl+zO9szmWZNGHm97V409qLjkyuVqOQ/VAlchO2CSBwn9vOg==",
+             "why": "the `with-associated-data` blob, character for character, opened under "
+                    "b\"contextId=c2\" instead of the b\"contextId=c1\" it was sealed with. The "
+                    "AEAD tag covers the associated data, so this is an authentication failure "
+                    "and not a decode failure: a caller who binds a contextId and then accepts "
+                    "the box under a different one has bound nothing."},
+            {"name": "associated-data-dropped", "adHex": "",
+             "blob": "913KMvf6CCFl+zO9szmWZNGHm97V409qLjkyuVqOQ/VAlchO2CSBwn9vOg==",
+             "why": "the same blob opened with NO associated data. This is the shape a port "
+                    "actually ships — `open_box(seed, pub, blob)` with the parameter left off — "
+                    "and it must fail exactly like the wrong value above, not silently succeed."},
         ],
     }
 
@@ -862,7 +929,405 @@ def _reject_message_cases() -> list[dict]:
                   "recipientDid": to,
                   "note": "validly signed, but `to` is not us. The signature verifies for the real "
                           "recipient; a client must still refuse a message not addressed to it."})
+
+    # ---- small-order-signer: ONE constant blob, no private key, every message ever sent.
+    #
+    # The Ed25519 group has a cofactor of 8, so eight points sit outside the prime-order
+    # subgroup. Take the one of order 1 — the identity, encoded 0x01 followed by 31 zero bytes
+    # — and publish it as your did:key. Verification asks [S]B == R + [h]A; when A is the
+    # identity, [h]A is the identity for EVERY scalar h, so R = the identity and S = 0 satisfies
+    # the equation over ANY message. The signature below is that blob: 0x01, then 63 zeros. It
+    # is CANONICAL base64 (b64_strict accepts the spelling), it is exactly 64 bytes, and the DID
+    # is a perfectly well-formed did:key — everything structural about this message is right.
+    # The refusal is the prime-order requirement and nothing else, which is why it is worth a
+    # vector: an implementation that reaches its Ed25519 library with these bytes and asks
+    # "does it verify?" is told YES by permissive RFC 8032 (Go's crypto/ed25519,
+    # `cryptography`'s OpenSSL, dalek's legacy `verify`).
+    #
+    # NOTE for the `did` group, which must NOT gain a case like this: the codec has to spell
+    # anything, including 0000…0000 and ffff…ffff, and it still does. The refusal belongs at
+    # the one door from a DID to a VERIFYING key (Go `VerifyingKeyFromDID`, Rust
+    # `verifying_key_from_did`, Python inside `ed25519_verify`, JavaScript from node:crypto).
+    identity_point = bytes([1]) + bytes(31)
+    identity_did = crypto.did_from_public(identity_point)
+    universal_blob = _b64(bytes([1]) + bytes(63))
+    assert crypto.b64_strict(universal_blob) is not None, \
+        "the forgery blob must be CANONICAL base64 — the refusal has to be the key, not the spelling"
+    add("small-order-signer", "small-order-key",
+        "`from` is the Ed25519 IDENTITY point as a did:key and `sig` is the constant blob "
+        "R = identity, S = 0, which satisfies [S]B == R + [h]A over EVERY message. No private "
+        "key exists or is needed. Derive the verifying key through the door that refuses the "
+        "fourteen small-order encodings — as `from` AND as the signature's first 32 bytes — not "
+        "through the codec.",
+        sig=universal_blob, over={"from_did": identity_did})
+
+    # ---- sig-not-canonical-base64: the case that looks completely well-formed.
+    add("sig-not-canonical-base64", "sig-not-canonical-base64",
+        "the same 64 signature bytes as the honest message, spelled with a different final DATA "
+        "character. Standard alphabet, length 88, two trailing '=', decodes without error to the "
+        "genuine signature — nothing about it is malformed. It is refused because the bytes do "
+        "not RE-ENCODE to the string that arrived: the last data character carries four bits no "
+        "decoder reads, so one signature has sixteen names, and a receiver that de-duplicates, "
+        "logs or replay-caches on the `sig` STRING sees sixteen messages where there is one.",
+        sig=_trailing_bit_sibling(good_sig))
+
+    # ---- wire-names-its-own-recipient: the message answers the question it was asked.
+    #
+    # An envelope honestly signed and honestly addressed to Alice, replayed at a verifier that
+    # knows no recipient of its own, with one unsigned field appended: `recipientDid`, equal to
+    # `to`. A verifier that falls back to a recipient carried BY THE MESSAGE then compares the
+    # wire against itself — `to == recipientDid` is true for every message ever minted — and the
+    # signature check that follows passes, because the signature really is valid. The JavaScript
+    # reference did exactly this (`opts.recipientDid ?? opts.me ?? fields.recipientDid`) and
+    # answered `true`.
+    #
+    # `verifierNamesNoRecipient` is the whole case: the runner must call its verifier with NO
+    # recipient. Naming one would make the case pass for the wrong reason. What each reference
+    # then does, and all three are refusals for the SAME rule (only the caller says who "me" is):
+    #   JavaScript  `verifyEnvelope(fields, {})` — `recipient` is null, refused before the
+    #               signature is looked at, with the unsigned field sitting right there in
+    #               `fields` where the old fallback would have found it.
+    #   Go / Rust   `Verify(sig, "")` — an empty recipient is refused; neither `Envelope` type
+    #               has a `recipientDid` member at all, so the wire's field cannot be consulted.
+    #   Python      there is no recipient option to fall back TO: `to` is one of the six SIGNED
+    #               fields and `verify_envelope` takes `to_did` by name from the caller, so the
+    #               signature simply fails for any `to_did` that is not Alice — including "".
+    #               Asserted here, both directions, rather than assumed.
+    self_named_sig = signed()
+    assert crypto.verify_envelope(frm, to, "m1", "c1", 1784273681, "pay the invoice", self_named_sig), \
+        "control: honest delivery to the real recipient is unaffected"
+    assert not crypto.verify_envelope(frm, "", "m1", "c1", 1784273681, "pay the invoice",
+                                      self_named_sig), \
+        "a verifier that names NO recipient must not verify this"
+    assert not crypto.verify_envelope(frm, other, "m1", "c1", 1784273681, "pay the invoice",
+                                      self_named_sig), \
+        "…and neither must anyone the message was not addressed to"
+    cases.append({"name": "wire-names-its-own-recipient", "category": "wrong-recipient",
+                  "mustReject": True, "verifierNamesNoRecipient": True,
+                  "input": {"from": frm, "to": to, "messageId": "m1", "contextId": "c1",
+                            "timestamp": 1784273681, "text": "pay the invoice",
+                            "sig": self_named_sig, "recipientDid": to},
+                  "note": "a valid envelope addressed to someone else, carrying an UNSIGNED "
+                          "`recipientDid` equal to `to`, presented to a verifier that names no "
+                          "recipient. An implementation that falls back to a recipient supplied by "
+                          "the message compares the wire against itself and accepts every replay. "
+                          "Who \"me\" is comes from the caller or from nowhere; `recipientDid` is "
+                          "not one of the six signed fields and must never be read as one."})
     return cases
+
+
+def _reject_encoding_cases() -> dict:
+    """Documents whose BYTES must be refused at the parse boundary — and two that must not be.
+
+    Every other group in this file hands an implementation a JSON VALUE. This one hands it raw
+    document bytes, as hex, because the defect it pins cannot survive a decoded value: by the
+    time a lone surrogate or an invalid UTF-8 byte has been through a repairing parser it is
+    U+FFFD, which is a legitimate character every reference encodes happily. Nothing downstream
+    can tell that anything happened.
+
+    WHY THAT IS A SIGNATURE PROBLEM AND NOT A TIDINESS ONE. `{"s":"\\ud800"}`, `{"s":"\\udfff"}`
+    and `{"s":"\\ufffd"}` are three different documents. After a repair they are one document,
+    and they sign one identical byte string. So a signature made over a message containing a
+    literal U+FFFD ALSO authenticates, at the repairing receiver, a message containing \\ud800
+    instead — content substitution under a signature that verifies, with nothing failing and
+    nobody told. Go's `encoding/json` repairs both of these silently, which is why the Go
+    reference now owns `Unmarshal`/`CanonicalFromJSON` and the runner is required to go through
+    them; `serde_json` refuses at the parse boundary; Python keeps the lone surrogate in the
+    `str` and `.encode("utf-8")` raises on it; JavaScript refuses it in `assertEncodable` after
+    a FATAL decode (`Buffer.toString('utf8')` is the lossy one, and measured: it turns all three
+    raw-byte cases below into an accepted `{"s":"\\ufffd"}`).
+
+    A lone surrogate can ride in JSON as a `\\ud800` ESCAPE, which is why four of the refusals
+    are ASCII documents; a raw invalid byte cannot be written any other way, which is why the
+    carrier for the whole group is hex rather than a JSON string.
+
+    `accept` is not decoration. A group that only ever refuses passes in an implementation that
+    refuses everything, so a literal U+FFFD and a well-formed astral pair — one spelled as an
+    escape pair, one as literal UTF-8 — are pinned here with the canonical bytes they must
+    produce. U+FFFD is a character like any other; it is the REPAIR that is forbidden, not the
+    code point."""
+    def refuses(raw: bytes) -> bool:
+        """Does the real Python path refuse these bytes? json.loads decodes with the
+        `surrogatepass` error handler, so a CESU-8 spelling of a surrogate survives the parse
+        and is caught one step later by `canonical`'s `.encode("utf-8")` — two doors, one
+        refusal, and the case list below deliberately contains both kinds."""
+        try:
+            crypto.canonical(json.loads(raw))
+        except Exception:
+            return True
+        return False
+
+    refuse_specs = [
+        ("lone-high-surrogate-escape", b'{"s":"\\ud800"}', "lone-surrogate",
+         "a high surrogate with nothing after it. Legal JSON text, not a legal string: no "
+         "character has this code point, and UTF-8 cannot encode it."),
+        ("lone-low-surrogate-escape", b'{"s":"\\udfff"}', "lone-surrogate",
+         "a low surrogate with nothing before it — the other half of the same rule."),
+        ("lone-surrogate-in-key", b'{"\\ud800":"x"}', "lone-surrogate",
+         "the same defect in a KEY. A canonicaliser that guards only string VALUES sorts and "
+         "emits this one straight into the bytes it signs."),
+        ("reversed-surrogate-pair", b'{"s":"\\udc00\\ud800"}', "lone-surrogate",
+         "low then high: two escapes that LOOK like a pair and are two lone surrogates. A "
+         "scanner that pairs on adjacency rather than on order accepts it."),
+        ("truncated-utf8-sequence", b'{"s":"\xe6\x97"}', "invalid-utf8",
+         "the first two bytes of the three-byte sequence for U+65E5, delivered without the "
+         "third. A repairing decoder yields one U+FFFD and signs it."),
+        ("stray-continuation-byte", b'{"s":"\x80"}', "invalid-utf8",
+         "a continuation byte that continues nothing. Never valid UTF-8 in any position."),
+        ("surrogate-encoded-as-utf8", b'{"s":"\xed\xa0\x80"}', "invalid-utf8",
+         "CESU-8: U+D800 written as three UTF-8-shaped bytes rather than as a \\ud800 escape. "
+         "Invalid UTF-8, and the case that proves the two refusals are one rule — Python's "
+         "json.loads decodes it with `surrogatepass` and hands `canonical` a lone surrogate, "
+         "so the document that entered as bad BYTES leaves through the surrogate door."),
+    ]
+    refuse = []
+    for name, raw, category, why in refuse_specs:
+        assert refuses(raw), f"encoding vector must actually be refused: {name}"
+        refuse.append({"name": name, "category": category, "mustReject": True,
+                       "documentHex": raw.hex(), "why": why})
+
+    accept_specs = [
+        ("literal-replacement-char", ('{"s":"%s"}' % _FFFD).encode("utf-8"),
+         "U+FFFD written by the sender ON PURPOSE. It is an ordinary character and MUST "
+         "canonicalize; refusing it would only trade one split for another, and it is the "
+         "control that stops this group passing by refusing everything."),
+        ("astral-pair-escape", b'{"s":"\\ud83d\\udc26"}',
+         "a WELL-FORMED surrogate pair, as JSON escapes. High then low, adjacent: one "
+         "character, U+1F426, and the canonical bytes carry it literally as UTF-8."),
+        ("astral-literal", '{"s":"\U0001F426"}'.encode("utf-8"),
+         "the same character as raw UTF-8 bytes. Two spellings of one document: both must "
+         "produce the identical canonical bytes as `astral-pair-escape` above."),
+    ]
+    accept = []
+    for name, raw, why in accept_specs:
+        canon = crypto.canonical(json.loads(raw)).decode("utf-8")
+        accept.append({"name": name, "documentHex": raw.hex(), "canonical": canon, "why": why})
+    assert accept[1]["canonical"] == accept[2]["canonical"], \
+        "the escape and the literal spelling of one astral character are one document"
+
+    return {
+        "note": "`documentHex` is the hex of the RAW DOCUMENT BYTES. Decode the hex, then parse, "
+                "then canonicalize: `refuse` must fail somewhere on that path and `accept` must "
+                "produce `canonical` exactly. Do not route this through a decoder that repairs — "
+                "Go's encoding/json and JavaScript's Buffer.toString('utf8') both substitute "
+                "U+FFFD and both then agree with a document nobody signed. The supported paths "
+                "are seam.Unmarshal / seam.CanonicalFromJSON (Go), a FATAL TextDecoder then "
+                "canonicalBytes (JavaScript), json.loads then crypto.canonical (Python), and "
+                "serde_json::from_slice then canonical (Rust).",
+        "accept": accept,
+        "refuse": refuse,
+    }
+
+
+def _reject_keystate_cases() -> dict:
+    """The KeyState ANTI-ROLLBACK rule: what a resolver that remembers must refuse.
+
+    Every other reject group is answered by one record. This one cannot be, because the defect
+    is not in any record here — all five VERIFY, all five are honestly root-signed. It is in a
+    resolver with no memory. `resolveOpDid` / `resolve_op_did` without a pin answers with
+    whatever the presenter attached, so a thief holding a burned op-key simply attaches the
+    older, still-validly-signed KeyState in which that key was not yet revoked. A `revokedOps`
+    read off the record being judged can only ever incriminate a key its own presenter chose to
+    incriminate.
+
+    So each case is a PAIR — a `pinned` record the caller kept from an earlier verified contact,
+    and an `inline` one the sender attached now — and the pin is the memory. The three refusals
+    are three shapes of the same missing ratchet:
+
+      * `replayed-lower-epoch` — an older record presented over a newer pin. Rollback is free
+        without one, because authenticity is not freshness.
+      * `pin-revokes-op` — an inline record at a genuinely HIGHER epoch that reinstates a key
+        the pin burned. The epoch ratchet alone does not save you: adoption is correct here, and
+        the pin's `revokedOps` is what must still refuse the key.
+      * `same-epoch-fork` — two records at ONE epoch naming different `opDid`s. Equal is not an
+        upgrade, it is a fork; the record we verified ourselves is the one we keep. (Measured on
+        the Python side 2026-08-11: pinned epoch 1 -> op1, and a replayed epoch-1 record naming
+        op0 resolved to op0.)
+
+    `accept` is load-bearing twice over. A resolver that ALWAYS returned the pin's `opDid` would
+    pass all three refusals and follow nobody's rotation — `higher-epoch-adopted` refuses it. A
+    resolver that ignored the pin argument entirely would pass `no-pin-first-contact`, which is
+    what keeps the three-argument behaviour pinned as well.
+
+    Each case says both what must NOT come back (`mustNotResolveTo`, the DID the attacker is
+    fishing for) and what MUST (`expect`). Asserting only the first would let a resolver pass by
+    answering the root every time — safe, and wrong: every enrolled peer's messages would then
+    fail as an unknown signer."""
+    from shared import keystate as ksmod
+    root_seed = bytes([21] * 32)
+    root = crypto.did_from_public(crypto.ed25519_public_from_seed(root_seed))
+    op1 = crypto.did_from_public(crypto.ed25519_public_from_seed(bytes([22] * 32)))
+    op2 = crypto.did_from_public(crypto.ed25519_public_from_seed(bytes([23] * 32)))
+    op_fork = crypto.did_from_public(crypto.ed25519_public_from_seed(bytes([24] * 32)))
+    check_now = 1784273681
+
+    def sign(message: bytes) -> str:
+        return _b64(crypto.ed25519_sign(root_seed, message))
+
+    def record(epoch: int, op: str, revoked: list[str] | None = None) -> dict:
+        return ksmod.make_keystate(root, epoch=epoch, op_did=op,
+                                   op_next_hash=ksmod.commit(op), ts=check_now,
+                                   root_sign=sign, revoked_ops=revoked or [])
+
+    def record_with_raw_revoked(epoch: int, op: str, revoked) -> dict:
+        """A record whose `revokedOps` is NOT a list, signed for real.
+
+        `make_keystate` cannot mint one — it does `list(revoked_ops or [])`, which raises on a
+        number — so the field is replaced here and the payload re-signed. That is not cheating
+        around a guard. A stranger holds their OWN root key, so nothing stops them minting
+        exactly this record, and `verify_keystate` says True for every one of them (asserted
+        below, because the whole case rests on it). The record is authentic; it is the FIELD
+        that is the wrong type, and authenticity has never been a statement about types."""
+        fields = {k: v for k, v in record(epoch, op).items() if k != "sig"}
+        fields["revokedOps"] = revoked
+        fields["sig"] = sign(ksmod._payload(fields))
+        return fields
+
+    e1 = record(1, op1)                       # the older, honest state
+    e2 = record(2, op2)                       # the state a caller has pinned
+    e2_burning_op1 = record(2, op2, [op1])    # …the same epoch, with op1 burned
+    e3_reinstating_op1 = record(3, op1)       # a HIGHER epoch that hands op1 back
+    e2_fork = record(2, op_fork)              # a second epoch-2 history
+
+    # A BURN LIST YOU CANNOT ENUMERATE BURNS NOTHING — and every one of these is a record a
+    # stranger can mint against their own root key and have verified. `revokedOps` is signed,
+    # so it is authentic; authenticity says nothing about its TYPE. Python's `in` means four
+    # different things depending on what it lands on, and `op_did in (revoked or [])` met all
+    # four: a number and a boolean take a TypeError out through a resolver documented as "pure
+    # and total", a string is a SUBSTRING test (so a 62-byte string burns an op-key the record
+    # never named), and a dict is membership over KEYS. The last two do not crash — they answer
+    # the wrong question, and the answer is "burned", which sends the resolver to the root and
+    # kills every message that peer signs with its live op-key.
+    e1_revoked_number = record_with_raw_revoked(1, op1, 5)
+    e1_revoked_boolean = record_with_raw_revoked(1, op1, True)
+    e1_revoked_string = record_with_raw_revoked(1, op1, "x" + op1 + "y")
+    e1_revoked_object = record_with_raw_revoked(1, op1, {op1: 1})
+    e1_revoked_empty = record(1, op1, [])       # the honest empty list: burns nothing
+    e1_revoked_self = record(1, op1, [op1])     # the honest full list: burns its own opDid
+
+    # CONTROL: every record here verifies on its own. No case in this group is about a bad
+    # signature, and one that failed for one would be pinning nothing. For the four
+    # wrong-typed records this control is the case's entire premise — if `verify_keystate`
+    # refused them, they would be unmintable and the guard downstream would be unreachable.
+    for name, rec in (("e1", e1), ("e2", e2), ("e2_burning_op1", e2_burning_op1),
+                      ("e3_reinstating_op1", e3_reinstating_op1), ("e2_fork", e2_fork),
+                      ("e1_revoked_number", e1_revoked_number),
+                      ("e1_revoked_boolean", e1_revoked_boolean),
+                      ("e1_revoked_string", e1_revoked_string),
+                      ("e1_revoked_object", e1_revoked_object),
+                      ("e1_revoked_empty", e1_revoked_empty),
+                      ("e1_revoked_self", e1_revoked_self)):
+        assert ksmod.verify_keystate(rec, expected_root_did=root, now=check_now), \
+            f"control: {name} must be a valid, root-signed KeyState"
+    assert e1_revoked_string["revokedOps"] != op1 and op1 in e1_revoked_string["revokedOps"], \
+        "the string case must CONTAIN the opDid without being it — that is the substring trap"
+
+    accept = [
+        {"name": "no-pin-first-contact", "pinned": None, "inline": e1, "expect": op1,
+         "why": "no pin yet, and a verifying inline record names the op-key. This IS first "
+                "contact and it must keep answering what it always answered — a resolver that "
+                "ignored its pin argument would pass every refusal below and fail here."},
+        {"name": "higher-epoch-adopted", "pinned": e1, "inline": e2, "expect": op2,
+         "why": "a STRICTLY greater epoch under the same rootKey is a real rotation and must be "
+                "adopted. Without this case a resolver that always returned the pin's own opDid "
+                "would pass the whole group and never follow anybody's rotation."},
+        # ---- `revokedOps` of the wrong type. A LIST, or nothing is burned.
+        #
+        # Every record below is authentically root-signed and verifies; a stranger holds their
+        # own root key, so all four are remotely mintable at will. Each must resolve to the op
+        # DID and — separately, and this is the half a `got == expect` comparison cannot state —
+        # each must NOT RAISE. An exception out of a resolver documented as pure and total is a
+        # verifier a stranger can switch off with one field, and it is a different failure from
+        # a wrong answer, so the runners report which.
+        {"name": "revoked-ops-number", "pinned": None, "inline": e1_revoked_number,
+         "expect": op1, "mustNotResolveTo": root, "mustNotRaise": True,
+         "why": "`revokedOps: 5`. Python's `x in 5` raises TypeError and JavaScript's "
+                "`Array.isArray` says no; the contract is the second answer. One field of the "
+                "wrong type in a correctly signed record must not turn a verifier off."},
+        {"name": "revoked-ops-boolean", "pinned": None, "inline": e1_revoked_boolean,
+         "expect": op1, "mustNotResolveTo": root, "mustNotRaise": True,
+         "why": "`revokedOps: true` — the same TypeError, and worth its own case because a "
+                "guard written as `isinstance(x, (list, tuple))` still admits neither while a "
+                "guard written as `if revoked:` admits both."},
+        {"name": "revoked-ops-string-containing-op", "pinned": None, "inline": e1_revoked_string,
+         "expect": op1, "mustNotResolveTo": root, "mustNotRaise": True,
+         "why": "`revokedOps` is a STRING with the opDid inside it. This one does not crash — "
+                "it answers the wrong question, because Python's `in` over a string is a "
+                "substring test, so one 62-byte string burns every op-key whose DID appears "
+                "anywhere in it. The answer it gives is `burned`, which sends the resolver to "
+                "the root and kills every message the peer signs with its live op-key."},
+        {"name": "revoked-ops-object-keyed-by-op", "pinned": None, "inline": e1_revoked_object,
+         "expect": op1, "mustNotResolveTo": root, "mustNotRaise": True,
+         "why": "`revokedOps` is an OBJECT keyed by the opDid — membership over dict keys, so "
+                "the record burns by shape rather than by content. The quiet twin of the "
+                "string case, and the reason the rule is `is it a list`, not `does `in` work`."},
+        {"name": "revoked-ops-empty-list", "pinned": None, "inline": e1_revoked_empty,
+         "expect": op1, "mustNotResolveTo": root,
+         "why": "the honest empty list burns nothing. Pinned so that `revokedOps` cannot be "
+                "made to burn by mere presence."},
+        {"name": "revoked-ops-genuine-list", "pinned": None, "inline": e1_revoked_self,
+         "expect": root, "mustNotResolveTo": op1,
+         "why": "THE CONTRAST, and the case that stops the four above being passed by an "
+                "implementation that ignores `revokedOps` altogether: a genuine `[opDid]` list "
+                "really does burn, and a state that burns its OWN opDid authorizes nobody, so "
+                "the answer is the root DID."},
+    ]
+    refuse = [
+        {"name": "replayed-lower-epoch", "category": "keystate-rollback", "mustReject": True,
+         "pinned": e2, "inline": e1, "mustNotResolveTo": op1, "expect": op2,
+         "why": "an epoch-1 record replayed over an epoch-2 pin. It VERIFIES — it really was "
+                "signed by this root — and that is the point: authenticity is not freshness, so "
+                "the only thing between a thief holding a retired op-key and a live delegation "
+                "is the epoch the caller remembers."},
+        {"name": "pin-revokes-op", "category": "keystate-revoked-op", "mustReject": True,
+         "pinned": e2_burning_op1, "inline": e3_reinstating_op1,
+         "mustNotResolveTo": op1, "expect": op2,
+         "why": "the inline record is at a HIGHER epoch, so the epoch ratchet adopts it — and it "
+                "names the very op-key the pin burned. The pin's `revokedOps` is the half with "
+                "teeth, because the stranger did not choose it. Answering the root would also be "
+                "safe and is still wrong: the pin stands behind its own opDid, so that is the "
+                "answer, and the root only when that one is burned too."},
+        {"name": "same-epoch-fork", "category": "keystate-fork", "mustReject": True,
+         "pinned": e2, "inline": e2_fork, "mustNotResolveTo": op_fork, "expect": op2,
+         "why": "two records at ONE epoch naming different opDids. Equal is not an upgrade, it "
+                "is a fork, and a resolver that adopts on `>=` takes the stranger's history over "
+                "the one it verified itself."},
+    ]
+
+    # GENERATION DISCIPLINE: every case goes through the real resolver before it reaches the
+    # file, all three claims asserted — it does not raise, it answers `expect`, and it does not
+    # answer `mustNotResolveTo`. The raise is checked first and separately because a resolver
+    # that throws is a resolver a stranger can turn off, and an AssertionError about the wrong
+    # DID would be a confusing way to learn that.
+    for c in accept + refuse:
+        try:
+            got = ksmod.resolve_op_did(root, c["inline"], c["pinned"], now=check_now)
+        except Exception as exc:                # noqa: BLE001 — the point is that NOTHING escapes
+            raise AssertionError(
+                f"keystate/{c['name']}: the resolver RAISED {type(exc).__name__}: {exc}. It is "
+                "documented pure and total, and this record is one a stranger can mint.") from exc
+        assert got == c["expect"], (c["name"], got, c["expect"])
+        if "mustNotResolveTo" in c:
+            assert got != c["mustNotResolveTo"], (c["name"], "resolved to the wrong key")
+
+    return {
+        "note": "The anti-rollback ratchet. `pinned` is a KeyState the CALLER kept from an "
+                "earlier verified contact; `inline` is what the sender attached to this message. "
+                "Resolve with both and compare against `expect` — JavaScript "
+                "`resolveOpDid(rootDid, inline, checkNow, {pinned})`, Python "
+                "`keystate.resolve_op_did(rootDid, inline, pinned, now=checkNow)`. The argument "
+                "ORDER differs between the two references, which is why the vector names fields "
+                "and never positions. Every record here verifies; nothing in this group is about "
+                "a bad signature. A case carrying `mustNotRaise` must also not throw: the "
+                "resolver is pure and total, and a record whose `revokedOps` is a number or a "
+                "boolean is one a stranger can mint against their own root key — an exception "
+                "there is a verifier switched off by one field, which is a DIFFERENT failure "
+                "from a wrong answer, so report which. Go and Rust implement no KeyState, and "
+                "their runners SKIP this group BY NAME rather than silently — an omission "
+                "nobody can see is the same as a check nobody has.",
+        "rootDid": root, "checkNow": check_now,
+        "accept": accept, "refuse": refuse,
+    }
 
 
 def _reject_invite_cases() -> tuple[list[dict], str]:
@@ -1052,13 +1517,25 @@ def build_vectors() -> dict:
         # fail-open client (how the Swift client shipped accepting forged senders, audit 2026-07-17).
         "reject": {
             "message": _reject_message_cases(),
+            # The bytes-in half. Everything else under `reject` is a decoded VALUE; this one is
+            # raw document bytes, because the defect it pins (a repaired lone surrogate, a
+            # repaired invalid byte) has already been erased by the time a value exists.
+            "encoding": _reject_encoding_cases(),
+            # The half no single record can carry. Every KeyState in this group verifies; what
+            # is refused is a RESOLVER with no memory of this root — see the group's note.
+            "keystate": _reject_keystate_cases(),
             "invite": _invite_reject,
             "claim": _reject_claim_cases(),
         },
         "rejectNote": "Each case MUST be rejected by your receiver (`mustReject`). `category` is "
                       "language-neutral guidance, NOT core's -32xxx — your own error taxonomy is "
                       "yours. message: verified with the key DERIVED FROM `from` "
-                      "(crypto.verify_envelope); invite: shared/invite.verify_invite, judged at the "
+                      "(crypto.verify_envelope) — and note that `wire-names-its-own-recipient` "
+                      "carries `verifierNamesNoRecipient`, which means the verifier must be called "
+                      "with NO recipient of its own; naming one makes the case pass for the wrong "
+                      "reason. encoding: raw document BYTES as hex, refused at the parse boundary "
+                      "(see that group's own note) with an `accept` half that must still "
+                      "canonicalize; invite: shared/invite.verify_invite, judged at the "
                       "case's `checkNow`; claim: signature MUST verify AND a one-time nonce THIS "
                       "device issued must be consumed before any trust is written. ONE case cannot "
                       "be a static vector: `claim-spent-nonce` (a replayed claim whose nonce was "
@@ -1222,9 +1699,19 @@ def test_cryptobox_vectors_actually_open() -> None:
     v = json.loads(VECTORS.read_text())["cryptobox"]
     recip = bytes.fromhex(v["recipientSeed"])
     for c in v["open"]:
-        got = cryptobox.open_box(recip, v["senderEncPub"], c["blob"])
+        # `adHex` is read WITHOUT a default. A missing key must be a KeyError here rather than
+        # a silently empty `ad`, because an empty `ad` is precisely the wrong answer for the
+        # case that carries one — and it would look green.
+        got = cryptobox.open_box(recip, v["senderEncPub"], c["blob"], bytes.fromhex(c["adHex"]))
         ok(got == bytes.fromhex(c["plaintextHex"]),
-           f"open_box reproduces the pinned plaintext: {c['name']}")
+           f"open_box reproduces the pinned plaintext: {c['name']}"
+           + (f" (ad={bytes.fromhex(c['adHex']).decode('utf-8', 'replace')!r})" if c["adHex"] else ""))
+    # The `ad` BINDING, both directions. Same blob, wrong associated data — and the AEAD tag
+    # covers `ad`, so this is an authentication failure, not a decode failure.
+    for c in v["mustNotOpen"]:
+        ok(cryptobox.open_box(recip, v["senderEncPub"], c["blob"],
+                              bytes.fromhex(c["adHex"])) is None,
+           f"and must NOT open: {c['name']}")
     # Negative control: a blob opened with the WRONG sender key must fail, not return garbage.
     other = cryptobox.enc_pub_hex(bytes([42] * 32))
     ok(cryptobox.open_box(recip, other, v["open"][0]["blob"]) is None,
@@ -1545,7 +2032,23 @@ def test_reject_vectors_are_rejected() -> None:
     rej = json.loads(VECTORS.read_text())["reject"]
 
     for c in rej["message"]:
-        if c["name"] == "wrong-recipient":
+        if c.get("verifierNamesNoRecipient"):
+            # The verifier knows no recipient of its own, and the message helpfully supplies
+            # one. In Python there is nothing to supply it TO: `to` is one of the six SIGNED
+            # fields and `verify_envelope` takes `to_did` from the CALLER, so the wire's
+            # unsigned `recipientDid` cannot reach the payload however hard it tries. Both
+            # halves are asserted — the honest delivery still verifies, and the caller who
+            # names nobody gets a signature failure — so this passes for its own reason and
+            # not because something upstream fell over.
+            i = c["input"]
+            honest = crypto.verify_envelope(i["from"], i["to"], i["messageId"], i.get("contextId"),
+                                            i["timestamp"], i["text"], i["sig"])
+            nobody = crypto.verify_envelope(i["from"], "", i["messageId"], i.get("contextId"),
+                                            i["timestamp"], i["text"], i["sig"])
+            ok(honest and not nobody and i.get("recipientDid") == i["to"],
+               f"message reject [{c['category']}]: {c['name']} — the wire names itself as the "
+               "recipient; a verifier that names none refuses (`to` is signed, `recipientDid` is not)")
+        elif c["name"] == "wrong-recipient":
             # NOT a signature failure — the sig verifies for the real recipient. The rejection is the
             # to==me check, which needs to know who we are. Assert both halves: the sig is valid, and
             # `to` is not us.
@@ -1555,6 +2058,76 @@ def test_reject_vectors_are_rejected() -> None:
                f"message reject [{c['category']}]: {c['name']} — sig valid, but `to` != us")
         else:
             ok(_verifier_rejects_message(c["input"]), f"message reject [{c['category']}]: {c['name']}")
+
+    # ---- the encoding group: raw document BYTES, through the real parse-and-canonicalize path.
+    #
+    # `json.loads` is handed the bytes rather than a str on purpose: that is the boundary where
+    # Python refuses an invalid UTF-8 document, exactly as `seam.Unmarshal` does in Go and
+    # `serde_json::from_slice` does in Rust. The surrogate escapes get past it (CPython decodes
+    # bytes with the `surrogatepass` handler) and are caught one step later by `canonical`'s
+    # `.encode("utf-8")`. Two doors, and a case for each kind, so neither can be removed unnoticed.
+    enc = rej["encoding"]
+    for c in enc["accept"]:
+        raw = bytes.fromhex(c["documentHex"])
+        got = crypto.canonical(json.loads(raw))
+        ok(got == c["canonical"].encode("utf-8"),
+           f"encoding accept: {c['name']} — canonicalizes to the pinned bytes")
+    for c in enc["refuse"]:
+        raw = bytes.fromhex(c["documentHex"])
+        try:
+            crypto.canonical(json.loads(raw))
+            refused = False
+        except Exception:
+            refused = True
+        ok(refused, f"encoding refuse [{c['category']}]: {c['name']}")
+    # The control that makes the two halves mean something. A REPAIRING reader — Go's
+    # encoding/json, JavaScript's Buffer.toString('utf8') — accepts every refusal above, and the
+    # bytes it produces COLLIDE: several of the refused documents become the ACCEPTED one. That
+    # is the vulnerability stated as arithmetic rather than as prose. A signature over the honest
+    # `literal-replacement-char` document also authenticates, at such a receiver, documents its
+    # signer never saw.
+    def _repaired(doc: bytes) -> bytes:
+        def fix(s: str) -> str:
+            return "".join(_FFFD if 0xd800 <= ord(ch) <= 0xdfff else ch for ch in s)
+        v = json.loads(doc.decode("utf-8", "replace"))
+        return crypto.canonical({fix(k): fix(x) if isinstance(x, str) else x
+                                 for k, x in v.items()})
+
+    honest_fffd = next(c["canonical"].encode("utf-8") for c in enc["accept"]
+                       if c["name"] == "literal-replacement-char")
+    repaired = [_repaired(bytes.fromhex(c["documentHex"])) for c in enc["refuse"]]
+    ok(repaired.count(honest_fffd) >= 2 and len(set(repaired)) < len(repaired),
+       f"a repairing reader turns {repaired.count(honest_fffd)} of the {len(enc['refuse'])} "
+       f"refused documents into `literal-replacement-char` — the ACCEPTED one — and collapses "
+       f"all {len(enc['refuse'])} to {len(set(repaired))} distinct byte strings. That collision "
+       "is what this group refuses: one signature would authenticate documents its signer never saw")
+
+    # ---- the keystate ratchet, through the real resolver.
+    #
+    # Both halves are asserted for every case: the DID that must come back, AND that it is not
+    # the one the attacker was fishing for. Only the second would let a resolver pass by
+    # answering the root every time — safe, and wrong in a way nobody notices until every
+    # enrolled peer's messages start failing as an unknown signer.
+    from shared import keystate as ksmod
+    kss = rej["keystate"]
+    for kind, group in (("accept", kss["accept"]), ("refuse", kss["refuse"])):
+        for c in group:
+            # A RAISE IS A FAILURE OF THE CASE, NOT A CRASH OF THE SUITE. `resolve_op_did` is
+            # documented pure and total, and `revoked-ops-number` / `revoked-ops-boolean` are
+            # records a stranger can mint that used to take a TypeError straight out through
+            # it. Letting that escape here would end the run with a traceback and no verdict —
+            # the reader would learn that something exploded, not which contract broke. An
+            # exception and a wrong answer are both refusals of the contract; they are
+            # different refusals, so they are reported differently.
+            try:
+                got = ksmod.resolve_op_did(kss["rootDid"], c["inline"], c["pinned"],
+                                           now=kss["checkNow"])
+            except Exception as exc:            # noqa: BLE001 — nothing may escape
+                got = f"RAISED {type(exc).__name__}: {exc}"
+            ok(got == c["expect"] and got != c.get("mustNotResolveTo"),
+               f"keystate {kind}: {c['name']}"
+               + (" — and must not raise" if c.get("mustNotRaise") else "")
+               + (f" [got {got}]" if isinstance(got, str) and got.startswith("RAISED") else ""))
 
     for c in rej["invite"]:
         now = datetime.fromisoformat(c["checkNow"].replace("Z", "+00:00"))
@@ -1578,11 +2151,13 @@ def test_reject_vectors_are_rejected() -> None:
     # A fail-open verifier (accepts everything, the RelayKit failure mode) must be REJECTED BY THE
     # SUITE: it should fail to reject the signature-based cases. Prove the suite would catch it.
     fail_open = lambda *a, **k: True
-    # Only the cases whose rejection IS a signature failure — wrong-recipient (valid sig, wrong `to`)
-    # and claim-unknown-nonce (valid sig, bad nonce) reject on a different axis, so a signature
-    # verifier is not what catches them.
+    # Only the cases whose rejection IS a signature failure. Three reject on a different axis and
+    # a signature verifier is not what catches them: wrong-recipient and
+    # wire-names-its-own-recipient (valid sig, the RECIPIENT is the question) and
+    # claim-unknown-nonce (valid sig, bad nonce).
+    _other_axis = ("wrong-recipient", "wire-names-its-own-recipient")
     sig_cases = [c["input"] for c in rej["message"]
-                 if c["input"].get("sig") is not None and c["name"] != "wrong-recipient"] + \
+                 if c["input"].get("sig") is not None and c["name"] not in _other_axis] + \
                 [c["input"]["message"] for c in rej["claim"]
                  if c["input"]["message"].get("sig") is not None and c["name"] != "claim-unknown-nonce"]
     missed = [inp for inp in sig_cases if _verifier_rejects_message(inp, verify=fail_open)]

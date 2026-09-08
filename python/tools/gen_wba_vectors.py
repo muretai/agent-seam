@@ -56,6 +56,20 @@ AGENT_URL = "https://agent.example/hp"
 #: directory above (its JWK is deliberately NOT in `jwks`).
 FOREIGN_SEED = bytes(range(1, 33))
 
+#: Two keys that ARE in the directory — as MALFORMED entries. Each is a real Ed25519 key,
+#: signing honestly, under its own real RFC 7638 thumbprint; the only defect is how the
+#: directory spells its `x`. A permissive reader finds the key and accepts the request; a
+#: reader that holds `x` to ONE spelling finds no key at all and refuses.
+#:
+#: WHY THE DEFECT GOES IN THE DIRECTORY AND NOT IN THE HEADERS. `keyid` is the thumbprint of
+#: the CANONICAL JWK — `jwk_thumbprint` re-derives it through `jwk_from_public` — so a
+#: re-spelled `x` thumbprints to exactly the same keyid as the honest spelling, and putting the
+#: bad spelling in the headers would change nothing anybody could observe. The directory is
+#: where it bites: `public_from_jwk` is the gate every untrusted entry passes through, and if
+#: it repairs, one key has many names in the one document whose whole job is naming keys.
+FOREIGN_SEED_LACED = bytes([0x5A] * 32)      # its `x` gets whitespace wedged into it
+FOREIGN_SEED_RESPELT = bytes([0x6B] * 32)    # its `x` gets a trailing-bit sibling
+
 
 class _Signer:
     """The minimal sign_bytes surface, seed-local to this generator."""
@@ -72,10 +86,65 @@ class _Signer:
 
 ME = _Signer(SEED)
 FOREIGN = _Signer(FOREIGN_SEED)
+LACED = _Signer(FOREIGN_SEED_LACED)
+RESPELT = _Signer(FOREIGN_SEED_RESPELT)
 
 JWK = wba.jwk_from_public(ME.public)
 KEYID = wba.jwk_thumbprint(JWK)
 FOREIGN_KEYID = wba.jwk_thumbprint(wba.jwk_from_public(FOREIGN.public))
+LACED_KEYID = wba.jwk_thumbprint(wba.jwk_from_public(LACED.public))
+RESPELT_KEYID = wba.jwk_thumbprint(wba.jwk_from_public(RESPELT.public))
+
+#: The base64url alphabet, in index order, for the trailing-bit sibling below.
+_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def laced_x(public: bytes) -> str:
+    """The honest `x` with a space and a tab wedged into it.
+
+    This is not a hypothetical. `base64.urlsafe_b64decode` DISCARDS every byte outside the
+    alphabet before decoding, so the laced string and the honest one used to be the same key —
+    and the guard that preceded `jws.unb64url`'s alphabet rule only ever refused such an input
+    by luck, because `-len(s) % 4` is computed on the RAW length and some junk counts happen to
+    misalign the padding. This lacing is chosen to be one of the counts where the luck runs
+    out: 45 characters, three pad characters, and a permissive decoder returns the honest 32
+    bytes. Asserted below rather than believed."""
+    x = jws.b64url(public)
+    return x[:10] + " " + x[10:20] + "\t" + x[20:]
+
+
+def respelt_x(public: bytes) -> str:
+    """The honest `x` with its LAST character replaced by a trailing-bit sibling.
+
+    43 characters carry 258 bits for a 256-bit key, so the final character has two bits that
+    belong to no byte and every decoder discards them: four alphabet-clean, correctly-lengthed
+    strings decode to one key. This is the family `jws.unb64url`'s re-encode leg collapses, and
+    it is the one an alphabet check cannot see — the string below is base64url and nothing but
+    base64url."""
+    x = jws.b64url(public)
+    v = _B64URL.index(x[-1])
+    return x[:-1] + _B64URL[(v & 0b111100) | ((v & 0b11) ^ 1)]
+
+
+LACED_JWK = {"crv": "Ed25519", "kty": "OKP", "x": laced_x(LACED.public)}
+RESPELT_JWK = {"crv": "Ed25519", "kty": "OKP", "x": respelt_x(RESPELT.public)}
+
+
+def _permissive(x: str) -> bytes:
+    """What a directory reader that repairs would make of `x` — the pre-`unb64url` behaviour,
+    reproduced here so the two entries below are pinned as REAL degeneracies rather than as
+    strings that merely look odd."""
+    import base64
+    return base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+
+
+for _jwk, _signer, _what in ((LACED_JWK, LACED, "whitespace-laced"),
+                             (RESPELT_JWK, RESPELT, "trailing-bit")):
+    assert wba.public_from_jwk(_jwk) is None, \
+        f"the {_what} entry must be UNREADABLE to the strict reader"
+    assert _permissive(_jwk["x"]) == _signer.public, \
+        f"…and READABLE to a permissive one, or the {_what} case pins nothing"
+    assert _jwk["x"] != jws.b64url(_signer.public), "…and it must differ from the honest spelling"
 
 AGENT_SF = '"' + AGENT_URL + '"'
 COMPONENTS = (("@authority", AUTHORITY), ("signature-agent", AGENT_SF))
@@ -234,21 +303,56 @@ bad("no signature headers at all", {"signature-agent": AGENT_SF})
 bad("Signature present, Signature-Input absent",
     {"signature": s, "signature-agent": AGENT_SF})
 
+# The two directory entries whose `x` is spelled wrong. Everything about these requests is
+# honest — a real key, a real signature, the real thumbprint as `keyid` — and the directory
+# does hold the key, in the sense that a repairing reader would find it. It must be refused,
+# because a JWK `x` names a key only when it is spelled the one way.
+si2, s2 = sign_exact(LACED, COMPONENTS, params_text(keyid=LACED_KEYID))
+bad("a directory JWK whose `x` is laced with whitespace — urlsafe_b64decode DISCARDS every "
+    "byte outside the alphabet, so this used to be the same key under another name",
+    headers(si2, s2))
+
+si2, s2 = sign_exact(RESPELT, COMPONENTS, params_text(keyid=RESPELT_KEYID))
+bad("a directory JWK whose `x` is a TRAILING-BIT sibling — 43 characters carry 258 bits for a "
+    "256-bit key, so four alphabet-clean strings decode to one key and only a re-encode tells "
+    "them apart", headers(si2, s2))
+
 # ------------------------------------------------------------------------------
 
 document = {
     "_": ("GENERATED by tools/gen_wba_vectors.py — do not edit. Frozen inputs to "
           "verify_request; re-derived by test_webbotauth.py (Python) and the contract "
-          "suite's WBA part (JS). now/authority/jwks are the verifier's inputs."),
+          "suite's WBA part (JS). now/authority/jwks are the verifier's inputs. `jwks` holds "
+          "ONE readable key and two entries whose `x` is spelled wrong — one laced with "
+          "whitespace, one a trailing-bit sibling. Those two are not decoration: the requests "
+          "signed under them are otherwise perfect, so a reader that repairs an `x` accepts "
+          "them, and a JWK `x` has exactly one spelling or a key has many names."),
     "seed_hex": SEED.hex(),
     "did": ME.did,
-    "jwks": {"keys": [JWK]},
+    "jwks": {"keys": [JWK, LACED_JWK, RESPELT_JWK]},
     "authority": AUTHORITY,
     "now": NOW,
     "accept": accept,
     "reject": reject,
 }
 
+# GENERATION DISCIPLINE, the same rule test_wire_vectors.py states: a vector nobody has watched
+# accept or refuse is decoration. Every case goes through the REAL verifier here, against the
+# document exactly as it is about to be written, so a case that is wrong cannot reach the file —
+# and the two malformed directory entries cannot silently stop mattering if `unb64url` is ever
+# loosened, because the requests they carry would start verifying right here.
+for _case in accept:
+    _got = wba.verify_request(_case["headers"], authority=AUTHORITY,
+                              jwks=document["jwks"], now=NOW)
+    assert _got == _case["expect_did"], ("accept case does not verify", _case["name"], _got)
+for _case in reject:
+    _got = wba.verify_request(_case["headers"], authority=AUTHORITY,
+                              jwks=document["jwks"], now=NOW)
+    assert _got is None, ("reject case was ACCEPTED", _case["name"], _got)
+
 OUT.write_text(json.dumps(document, indent=2, sort_keys=False) + "\n",
                encoding="utf-8")
-print(f"wrote {OUT}: {len(accept)} accept, {len(reject)} reject")
+print(f"wrote {OUT}: {len(accept)} accept, {len(reject)} reject "
+      f"({len(document['jwks']['keys'])} directory entries, "
+      f"{sum(1 for k in document['jwks']['keys'] if wba.public_from_jwk(k) is None)} of them "
+      "unreadable on purpose)")

@@ -42,7 +42,6 @@ Reuses shared/crypto only (zero deps), mirroring shared/invite.py + shared/fleet
 
 from __future__ import annotations
 
-import base64
 from typing import Any
 
 from shared import crypto
@@ -120,7 +119,16 @@ def verify_card_envelope(envelope: Any,
         did = card["did"]
         if expected_did is not None and did != expected_did:
             return None
-        sig_raw = base64.b64decode(sig)
+        sig_raw = crypto.b64_strict(sig)
+        if sig_raw is None:
+            return None
+        # No LENGTH bound, unlike the twin's flat 64 (js/seam.mjs `verifyCardEnvelope`): that
+        # side reads an Ed25519 card DID or nothing, while this envelope is documented
+        # curve-agnostic in the header above -- a P-256 / WebAuthn DID's card verifies here,
+        # and such a signer emits ASN.1 DER of ~70-72 bytes. A wrong-length Ed25519 signature
+        # is already refused one line later by `crypto.verify`, so a flat 64 would change no
+        # verdict on any card the twin can read and would refuse a publisher this module
+        # promises to read. The spelling was the split; the length is not.
         # `ts` AS RECEIVED — the `float(ts)` that was here is what makes this verifier able to read
         # an OLDER node's card at all: those envelopes carry a float on the wire, so canonicalizing
         # what arrived reproduces their signed bytes exactly. Coercing instead would have re-rendered

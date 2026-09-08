@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Callable, Optional, Tuple
 
 from shared import crypto
@@ -62,6 +63,14 @@ ALG = "EdDSA"
 #: verifier chew through attacker-chosen input.
 MAX_TOKEN_BYTES = 16384
 
+#: The base64url alphabet, WHOLE. Anchored with \A/\Z and not ^/$ because PYTHON's `$` also
+#: matches just before a final newline, so `^…$` would accept a value with a trailing LF —
+#: precisely one of the second spellings this regex exists to refuse. (JavaScript's `$` has no
+#: such exception, which is why the twin's `WBA_B64URL` in js/seam.mjs spells the same rule
+#: `^[A-Za-z0-9_-]*$`. Same accepted set, two languages' anchors.) Compiled once: it runs on
+#: every segment of every token. NECESSARY BUT NOT SUFFICIENT — see rule 3 in unb64url.
+_B64URL_RE = re.compile(r"\A[A-Za-z0-9_-]*\Z")
+
 
 def b64url(data: bytes) -> str:
     """base64url WITHOUT padding (RFC 7515 §2 requires the padding be stripped)."""
@@ -69,21 +78,81 @@ def b64url(data: bytes) -> str:
 
 
 def unb64url(s: str) -> bytes:
-    """Decode unpadded base64url. Raises ValueError on anything malformed.
+    """Decode unpadded base64url, or raise ValueError. ONE spelling per byte string.
 
-    Strict on purpose: `validate=True` rejects characters outside the base64url
-    alphabet instead of silently discarding them, so two different token strings can
-    never decode to the same bytes (a signature-stripping trick in disguise)."""
+    Three rules, and none of them is what the standard library does:
+
+      1. EVERY character must be in the base64url alphabet. `base64.urlsafe_b64decode`
+         silently DISCARDS every byte outside the alphabet — not just the standard-base64
+         "+", "/" and "=" this function used to name by hand, but whitespace, punctuation,
+         control characters, anything. So "AAAA" and "A A A A" were the same three bytes,
+         and a 43-character JWK `x` with a newline, a tab or three "!" wedged into it was
+         the same key as the honest spelling. The old guard LOOKED like it worked only
+         because `-len(s) % 4` is computed on the RAW length, so some junk counts happened
+         to misalign the padding and raise — luck, per input, not a rule.
+      2. A length congruent to 1 (mod 4) is refused explicitly. Six bits is not a byte, so
+         NO byte string encodes to such a length. Today's CPython happens to raise on it
+         from inside binascii ("number of data characters … cannot be 1 more than a multiple
+         of 4"), but that is the C decoder's error checking, not a rule this function ever
+         stated — and the identical input is silently TRUNCATED by Node's
+         `Buffer.from(x, "base64url")`, which is why the JavaScript twin checks it by hand.
+         Stating it here costs one comparison and makes both implementations refuse the same
+         strings for the same reason, instead of each inheriting whatever its base64 decoder
+         does this release. (Same argument shared/neturl.py makes for canonicalizing an
+         address itself rather than trusting version-dependent `ipaddress` predicates.)
+      3. The decoded bytes must RE-ENCODE to the input, exactly. This is the rule that
+         actually delivers the "one spelling" in the first line, and rules 1 and 2 do not
+         imply it — read this part twice, because the alphabet check LOOKS complete and is
+         not. A base64 character carries 6 bits and a byte carries 8, so unless the length
+         is a multiple of 4 the final character has bits that no byte claims: 43 characters
+         (the length of an Ed25519 JWK `x`) is 258 bits carrying 256, and the last two bits
+         are discarded on decode. Every one of the 4 values of those bits spells a
+         DIFFERENT, alphabet-clean, correctly-lengthed string that decodes to the SAME 32
+         key bytes — "…Hh8", "…Hh9", "…Hh-" and "…Hh_" are one key with four names. The
+         size of the family is fixed by the length mod 4: ≡ 3 leaves 2 spare bits and so
+         FOUR names (a 32-byte key, a 32-byte thumbprint); ≡ 2 leaves 4 and so SIXTEEN —
+         which is what an Ed25519 signature segment is, 64 bytes in 86 characters; ≡ 0 is
+         exact and already has one. Re-encoding and comparing collapses every family to the
+         single member a standard encoder emits, because `b64url` always writes the spare
+         bits as zero. The JavaScript twin's `WBA_B64URL` had the identical hole and is
+         closing it the same way in the same round — this was never a divergence between
+         the implementations, only a gap they shared.
+
+    Why an alias matters more here than in a general codec: the value is very often a JWK
+    `x` — a PUBLIC KEY (shared/webbotauth.public_from_jwk) — and a relying party is
+    entitled to treat that literal string as the key's NAME: to store it, index it, compare
+    it, de-duplicate on it. Under the old check one key had endlessly many names, so a
+    directory could hold N entries for a single key, a check keyed on the string could miss
+    the key it was meant to match, and a peer echoing an `x` back could re-spell it in
+    transit without changing the key it names. The same argument applies to the header and
+    signature segments verify_compact() splits out: two token texts decoding alike is the
+    shape every signature-stripping trick is cut from.
+
+    `validate=True` is NOT the fix, tempting as the name is: it validates the STANDARD
+    alphabet (so "-" and "_" would be the rejects) and it rejects the very padding we
+    strip. The alphabet has to be checked here, before the stdlib is allowed to be
+    generous.
+
+    A wire contract whose two reference implementations disagree about which strings are
+    keys is not a contract — and one where BOTH accept four strings for one key is not much
+    better, which is why rule 3 lands on both sides together."""
     if not isinstance(s, str):
         raise ValueError("expected str")
-    # Reject the standard-base64 alphabet explicitly: "+" and "/" decoding as though
-    # they were "-" and "_" would let one signature validate under two spellings.
-    if "+" in s or "/" in s or "=" in s:
+    if not _B64URL_RE.match(s):
         raise ValueError("not unpadded base64url")
+    if len(s) % 4 == 1:
+        raise ValueError("not unpadded base64url (a length of 1 mod 4 decodes to nothing)")
     try:
-        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+        raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
     except Exception as exc:                       # binascii.Error and friends
         raise ValueError(f"bad base64url: {exc}") from exc
+    # Rule 3, and the only one that actually makes the mapping injective: b64url() writes
+    # the final character's spare bits as zero, so re-encoding names the ONE member of the
+    # trailing-bit family a standard encoder would have produced. Cheap, total, and it
+    # cannot drift from the encoder because it IS the encoder.
+    if b64url(raw) != s:
+        raise ValueError("not canonical base64url (it re-encodes to a different string)")
+    return raw
 
 
 def kid_for(did: str) -> str:
@@ -121,6 +190,13 @@ def sign_compact(payload: dict, *, did: str,
     if hdr.get("alg") != ALG:
         raise ValueError("this module signs EdDSA only")
     si = signing_input(hdr, payload)
+    # The one other base64 decode in this module, and deliberately NOT given unb64url's
+    # strictness: this reads OUR OWN signer's output (Identity.sign_bytes, standard base64
+    # per the repo-wide convention), not a value off the wire, and a remote-signer backend
+    # is free to hand back a padded / newline-terminated blob the way any base64 producer
+    # may. The alias worry does not arise either — the bytes are immediately re-encoded
+    # with b64url() into a token, so a signer that spelled its output oddly produces a
+    # signature that simply fails to verify, loudly, rather than a second name for a key.
     raw = base64.b64decode(sign_bytes(si))
     return "%s.%s" % (si.decode("ascii"), b64url(raw))
 

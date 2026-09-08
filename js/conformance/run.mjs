@@ -12,9 +12,10 @@
  * and extended to the groups the block implements: did decode, cardpub verify, cryptobox open,
  * device binding v2, and Web Bot Auth over vectors/wba_vectors.json.
  *
- * NOT here (follow-ups, see README): `keystate`/`ownerState` (verifyKeystate is pinned only by
- * core's live harness — no vector group yet), `binding` v1, `relay`, `invite`, `domainLinkage`
- * (no JS implementation in the block).
+ * NOT here (follow-ups, see README): `ownerState`, `binding` v1, `relay`, `invite`,
+ * `domainLinkage` (no JS implementation in the block). `keystate` IS here now, as
+ * `reject.keystate`: the anti-rollback ratchet, driven through the four-argument
+ * `resolveOpDid(rootDid, inline, now, { pinned })`.
  *
  * Run:  node js/conformance/run.mjs      (from the repo root)      npm test
  */
@@ -24,9 +25,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-  canonicalJSON, didFromPublicKeyHex, publicKeyHexFromDid, publicKeyFromSeedHex, signingPayload,
-  signEnvelope, verifyEnvelope, cardEnvelopePayload, verifyCardEnvelope, encPubHex, openBox,
-  verifyDeviceBindingV2, wbaVerifyRequest,
+  canonicalJSON, canonicalBytes, didFromPublicKeyHex, publicKeyHexFromDid, publicKeyFromSeedHex,
+  signingPayload, signEnvelope, verifyEnvelope, cardEnvelopePayload, verifyCardEnvelope,
+  encPubHex, openBox, verifyDeviceBindingV2, wbaVerifyRequest, resolveOpDid,
 } from '../seam.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -87,16 +88,105 @@ for (const v of vectors.envelope) {
 
 // ---------------------------------------------------------------- the refusals
 // The case's message lives under `input`; `recipientDid` (when a case pins one) sits beside
-// it at the top level. Reading the recipient from the top level is what makes each case
-// exercise the attack it is named for rather than fail for "no recipient".
+// it at the TOP LEVEL, and that distinction is what this loop turns on. The top level is the
+// CALLER — the verifier's own idea of who it is. Everything inside `input` arrived on the wire
+// and is the attacker's to write.
+//
+// So the fallback chain reads the top level and then `input.to`, and NEVER
+// `input.recipientDid`. It used to read that too, which quietly made
+// `wire-names-its-own-recipient` unable to fail: the runner would have handed `verifyEnvelope`
+// the very field the case exists to prove is ignored, and the check would have been green
+// whichever way the library behaved.
+//
+// `verifierNamesNoRecipient` is the other half. The verifier is called with NO recipient at
+// all, while the message's own unsigned `recipientDid` is copied into `fields` and left
+// exactly where a fallback would find it. `verifyEnvelope` must refuse before it ever looks at
+// the signature — which is genuinely valid, for a real recipient — because who "me" is comes
+// from the caller or from nowhere.
 for (const v of vectors.reject.message) {
   const m = v.input ?? v;
   const fields = { from: m.from, to: m.to, messageId: m.messageId, contextId: m.contextId ?? null,
                    timestamp: m.timestamp, text: m.text, sig: m.sig };
+  if (m.recipientDid !== undefined) fields.recipientDid = m.recipientDid;   // unsigned, and bait
+  const opts = v.verifierNamesNoRecipient ? {} : { recipientDid: v.recipientDid ?? m.to };
   let accepted;
-  try { accepted = verifyEnvelope(fields, { recipientDid: v.recipientDid ?? m.recipientDid ?? m.to }); }
+  try { accepted = verifyEnvelope(fields, opts); }
   catch { accepted = false; }                    // refusing by throwing is still refusing
-  check(accepted === false, `reject/${v.name}`, accepted === false ? '' : `ACCEPTED a message it must refuse — ${v.why || ''}`);
+  check(accepted === false, `reject/${v.name}`,
+        accepted === false ? '' : `ACCEPTED a message it must refuse — ${v.note || v.why || ''}`);
+}
+
+// ---------------------------------------------------------------- the encoding boundary
+// `reject.encoding` carries RAW DOCUMENT BYTES as hex rather than a parsed value, because the
+// defect it pins does not survive a parse: a repaired lone surrogate and a repaired invalid
+// byte are both U+FFFD by then, and U+FFFD is a character this reference encodes happily. The
+// evidence is gone one line before the bytes get signed.
+//
+// THE DECODE MUST BE FATAL, and that is the trap. `buf.toString('utf8')` REPAIRS — measured on
+// this build: `truncated-utf8-sequence`, `stray-continuation-byte` and `surrogate-encoded-as-
+// utf8` all come back as ordinary strings and canonicalize without complaint, two of them
+// straight into the canonical bytes of `literal-replacement-char`, which is a document in the
+// ACCEPT half. A runner that decoded that way would print three green checks for three
+// documents this reference had just silently rewritten. So the boundary is a fatal
+// TextDecoder, which is what the seam asks of any JavaScript caller reading bytes off a wire.
+//
+// `canonicalBytes`, not `canonicalJSON`: `assertEncodable` lives in the former, and it is what
+// refuses the surrogate ESCAPES — legal JSON text, illegal strings, which the fatal decoder
+// cannot see because the document is pure ASCII. Two doors in JavaScript where Go has one, and
+// both are required.
+{
+  const fatal = new TextDecoder('utf-8', { fatal: true });
+  const parse = (hex) => JSON.parse(fatal.decode(Buffer.from(hex, 'hex')));
+  const enc = vectors.reject.encoding;
+  for (const c of enc.accept) {
+    const got = attempt(() => canonicalBytes(parse(c.documentHex)).toString('utf8'));
+    check(got === c.canonical, `encoding/accept/${c.name}`,
+          got === c.canonical ? '' : `want ${JSON.stringify(c.canonical)}\n      got  ${JSON.stringify(got)}`);
+  }
+  for (const c of enc.refuse) {
+    let refused;
+    try { canonicalBytes(parse(c.documentHex)); refused = false; } catch { refused = true; }
+    check(refused, `encoding/refuse/${c.name}`, `ACCEPTED bytes it must refuse — ${c.why || ''}`);
+  }
+}
+
+// ---------------------------------------------------------------- the KeyState ratchet
+// Every record in this group VERIFIES. Nothing here is about a bad signature — what is refused
+// is a RESOLVER with no memory of this root, which answers with whatever the presenter attached
+// and therefore honours an older, still-validly-signed KeyState in which a burned op-key was
+// not yet burned.
+//
+// So the call is the FOUR-argument form, `resolveOpDid(rootDid, inline, checkNow, { pinned })`,
+// and `opts.pinned` is that memory. The two references take these in a different ORDER — Python
+// is `resolve_op_did(root, inline, pinned, now=…)` — which is why the vector carries `pinned`
+// and `inline` as named fields and never as positions.
+//
+// Both halves of every case are asserted: the DID that must come back, AND that it is not the
+// one the attacker was fishing for. Only the second would let a resolver pass by answering the
+// root every time — safe, and wrong in a way nobody notices until every enrolled peer's
+// messages start failing as an unknown signer.
+//
+// A THROW IS THAT CASE FAILING, NOT THE RUNNER CRASHING. The `revoked-ops-*` cases carry
+// `mustNotRaise`, and they earn it: `revokedOps: 5` and `revokedOps: true` are records a
+// stranger can mint against their own root key, they VERIFY, and Python's `x in 5` used to take
+// a TypeError straight out through a resolver documented as pure and total. `attempt` turns any
+// throw into a `THREW: …` string, which can never equal the expected DID, so the case fails by
+// name and the reader learns which contract broke rather than that something exploded. An
+// exception and a wrong answer are both refusals of the contract; they are different refusals.
+//
+// The `kind` comes from WHICH LIST the case is in, never from sniffing a field. It used to be
+// derived from the presence of `mustNotResolveTo`, and the `revoked-ops-*` cases carry that
+// field too — over-revocation sends the resolver to the root, which is precisely the wrong
+// answer worth naming — so the sniff would have labelled half the accept half as refusals.
+{
+  const ks = vectors.reject.keystate;
+  for (const [kind, group] of [['accept', ks.accept], ['refuse', ks.refuse]]) {
+    for (const c of group) {
+      const got = attempt(() => resolveOpDid(ks.rootDid, c.inline, ks.checkNow, { pinned: c.pinned }));
+      check(got === c.expect && got !== c.mustNotResolveTo, `keystate/${kind}/${c.name}`,
+            `want ${c.expect}\n      got  ${got}\n      ${c.why || ''}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- the signed Agent Card envelope
@@ -119,10 +209,23 @@ for (const c of vectors.cardpub) {
   const b = vectors.cryptobox;
   check(attempt(() => encPubHex(b.senderSeed)) === b.senderEncPub, 'cryptobox/encPub/sender');
   check(attempt(() => encPubHex(b.recipientSeed)) === b.recipientEncPub, 'cryptobox/encPub/recipient');
+  // `adHex` is read with NO default. Every case carries it, empty ones included, so that a
+  // missing field throws here instead of quietly becoming the empty `ad` — which is the wrong
+  // answer for the one case that has associated data, and would look green.
+  const ad = (c) => Buffer.from(c.adHex, 'hex');
   for (const c of b.open) {
-    const pt = attempt(() => openBox(b.recipientSeed, b.senderEncPub, c.blob));
+    const pt = attempt(() => openBox(b.recipientSeed, b.senderEncPub, c.blob, ad(c)));
     const hex = pt && typeof pt !== 'string' ? Buffer.from(pt).toString('hex') : String(pt);
     check(hex === c.plaintextHex, `cryptobox/open/${c.name}`, hex === c.plaintextHex ? '' : `want ${c.plaintextHex}\n      got  ${hex}`);
+  }
+  // The `ad` BINDING. The AEAD tag covers the associated data, so the same blob under the wrong
+  // `ad` — or under none, which is the shape a port actually ships — is an AUTHENTICATION
+  // failure, not a decode failure. `null`, and never a partial read: a caller who binds a
+  // contextId and then opens the box under a different one has bound nothing.
+  for (const c of b.mustNotOpen) {
+    const pt = attempt(() => openBox(b.recipientSeed, b.senderEncPub, c.blob, ad(c)));
+    check(pt === null, `cryptobox/must-not-open/${c.name}`,
+          `OPENED a box sealed under different associated data — ${c.why || ''}`);
   }
 }
 

@@ -90,6 +90,8 @@
         "did",
         "envelope",
         "reject.message",
+        "reject.encoding",
+        "reject.keystate",
         "cardpub",
         "cryptobox",
         "bindingV2",
@@ -115,6 +117,8 @@
         "domainLinkage",
         "webBotAuth",
         "reject",
+        "reject.encoding",
+        "reject.keystate",
         "webBotAuth(wba_vectors)"
       ]
     },
@@ -127,8 +131,13 @@
         "numberHazards",
         "did(ed25519)",
         "envelope",
-        "reject.message"
-      ]
+        "reject.message",
+        "reject.encoding"
+      ],
+      "skips": [
+        "reject.keystate"
+      ],
+      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState in this reference to hold to the ratchet."
     },
     {
       "lang": "rust",
@@ -139,8 +148,13 @@
         "numberHazards",
         "did(ed25519)",
         "envelope",
-        "reject.message"
-      ]
+        "reject.message",
+        "reject.encoding"
+      ],
+      "skips": [
+        "reject.keystate"
+      ],
+      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState in this reference to hold to the ratchet."
     }
   ]
 }

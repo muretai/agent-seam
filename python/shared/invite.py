@@ -47,17 +47,22 @@ from shared import vc as vcmod   # reuse the ISO time parser (vcmod._parse_iso)
 from shared import httpua
 
 # Short-link registration + resolution hit the relay over urllib; a bare Python-urllib UA is
-# 403'd by a Cloudflare-fronted relay (shared/httpua.py), so a non-default UA must be
-# installed process-wide before any of them dials. `install()` is idempotent, and it is
-# called from EACH of the three functions that dial rather than at import.
+# 403'd by a Cloudflare-fronted relay (shared/httpua.py), so every dial in this module has to
+# carry a non-default one. It rides on the REQUEST: either as an explicit header on the
+# Request `register_short` builds (the shape shared/webbotauth.py's directory fetch uses), or
+# from `neturl.opener()`, whose addheaders already carries `httpua.USER_AGENT`.
 #
-# Why not at import, which is where it used to be: `urllib.request.install_opener` is a
-# process-global mutation, and this module is part of the wire contract that other programs
-# import for `verify_invite` alone — a verifier, embedded in somebody's tool, silently
-# re-configuring their HTTP client is a side effect nobody asked for and nobody can see. The
-# functions that actually dial are the honest place to put it, and there are exactly three.
-def _ua_installed() -> None:
-    httpua.install()
+# NOT from `httpua.install()`, which is where it used to come from. That function calls
+# `urllib.request.install_opener` — a PROCESS-GLOBAL mutation — and it was invoked from a
+# `_ua_installed()` helper at each of the three functions that dial. So merely resolving one
+# invite link silently replaced the HOST APPLICATION's global opener, discarding whatever
+# proxy, authentication, cookie or redirect handlers it had installed; shared/ is vendored
+# verbatim into other people's programs, many of which import this module for `verify_invite`
+# alone. Moving the call from import time to the dialing functions (which is what the previous
+# round did) shrank the window without changing the fact: a library does not get to rewrite a
+# global on its caller's behalf. The header belongs on the request, where it is visible at the
+# call site and affects nothing else. `install()` stays public for an APPLICATION to call
+# deliberately at its own startup.
 
 SCHEME = "agent://invite?d="
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600    # an invite is good for a week by default
@@ -221,7 +226,6 @@ def _serves_code(base: str, code: str, timeout: float) -> bool:
     Guarded and capped like `resolve_link`, though `base` here is our own gateway rather
     than a stranger's: two functions that dial the same path must not diverge on how they
     dial it, or the next reader has to work out which one was the hardened one."""
-    _ua_installed()
     from shared import httputil, neturl
     if not neturl.peer_base_ok(base):
         return False
@@ -255,15 +259,40 @@ def register_short(card: dict[str, Any], relay_base: str,
     against the canonical base, and only adopt it if a GET there returns the card. So a
     self-hosted/private relay keeps its own link (rewriting it would hand out a DEAD link
     to a store that never had the code), and a new alias for the muretai relay works with
-    no list to maintain and nothing to forget to update."""
-    _ua_installed()
+    no list to maintain and nothing to forget to update.
+
+    `relay_base` IS SOMEBODY ELSE'S STRING. It arrives from `--relay`, from a node.env an
+    installer wrote, and from the `relay` field of an invite card the INVITER signed — a
+    field `verify_invite` proves the authorship of and says nothing about the shape of. This
+    function used to hand it to a bare `urllib.request.urlopen`, which is a server-side
+    request to an arbitrary host and an arbitrary scheme (urlopen's default opener serves
+    `file://` too), a 302 into a private network followed without a second look, and a
+    `.read()` with no ceiling on either the body or the clock. It now dials the way
+    `_serves_code` and `resolve_link` in this same module dial: the SSRF guard first, the
+    path joined rather than concatenated, the redirect-checking opener, and a capped,
+    time-budgeted read. Two functions in one module that dial the same relay must not
+    disagree about how, or the next reader has to work out which one was the hardened one."""
+    from shared import httputil, neturl
+    if not neturl.peer_base_ok(relay_base):
+        return None                            # same fail-closed None as every other failure
     import urllib.request
     try:
         data = json.dumps(card, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(relay_base.rstrip("/") + "/i", data=data,
-                                     headers={"Content-Type": "application/json"},
-                                     method="POST")
-        r = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+        req = urllib.request.Request(
+            neturl.join(relay_base, "/i"), data=data,
+            headers={"Content-Type": "application/json",
+                     # Explicit, like shared/webbotauth.py's directory fetch. `neturl.opener()`
+                     # supplies the same value as a default, but a Request that names its own
+                     # User-Agent does not depend on which opener happens to send it — and
+                     # nothing here mutates a global to get it (see the note above SCHEME).
+                     "User-Agent": httpua.USER_AGENT},
+            method="POST")
+        with neturl.opener().open(req, timeout=timeout) as resp:
+            # `budget_s=timeout`, the same value `_serves_code` and `resolve_link` pass: a
+            # wall-clock ceiling on the body, because `timeout=` is only a per-recv socket
+            # deadline and a trickling responder resets it forever (httputil.read_response).
+            raw = httputil.read_response(resp, budget_s=timeout)
+        r = json.loads(raw.decode("utf-8"))
         link, code = r.get("link"), r.get("code")
         if not link:
             return None
@@ -299,7 +328,6 @@ def resolve_link(link: str, *, timeout: float = 10.0) -> dict[str, Any]:
     SSRF guard, the redirect-checking opener, and the response cap — instead of a bare
     `urlopen().read()` that would follow a 302 anywhere and read a body of any size
     """
-    _ua_installed()
     link = link.strip()
     if "d=" in link:
         return decode_link(link)

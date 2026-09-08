@@ -161,11 +161,16 @@ def public_from_jwk(jwk: Any) -> Optional[bytes]:
     """The 32 raw key bytes of an Ed25519 JWK, or None. Never raises.
 
     Strict, because this is the gate every untrusted directory entry passes through:
-    `kty` must be OKP, `crv` must be Ed25519, and `x` must be UNPADDED base64url
-    (jws.unb64url refuses "+", "/" and "=") decoding to exactly 32 bytes. A padded or
-    standard-alphabet `x` is rejected rather than repaired — two spellings of one key
-    would thumbprint differently, which is the ambiguity the whole proof rests on not
-    having. Other key types (P-256, RSA) simply are not this network's identity."""
+    `kty` must be OKP, `crv` must be Ed25519, and `x` must be CANONICAL unpadded base64url
+    decoding to exactly 32 bytes. Canonical is the whole of jws.unb64url's contract and it
+    is stronger than the alphabet: every character in `[A-Za-z0-9_-]`, no padding, and the
+    32 bytes must RE-ENCODE to the very string that arrived. That last clause is not
+    pedantry — 43 characters carry 258 bits for a 256-bit key, so the final character's two
+    spare bits are free, and without the round-trip "…Hh8", "…Hh9", "…Hh-" and "…Hh_" are
+    four names for one key. A padded, standard-alphabet, whitespace-laced or trailing-bit
+    variant is REJECTED rather than repaired — two spellings of one key would thumbprint
+    differently, which is the ambiguity the whole proof rests on not having. Other key
+    types (P-256, RSA) simply are not this network's identity."""
     try:
         if not isinstance(jwk, dict):
             return None

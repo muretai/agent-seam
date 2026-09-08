@@ -12,7 +12,7 @@
 //!
 //!     cd rust && cargo run --quiet --bin conformance
 
-use agent_seam::{canonical, did_from_public_key, public_key_from_did, Envelope};
+use agent_seam::{canonical, decode_signature, did_from_public_key, public_key_from_did, Envelope};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::Value;
 use std::process::exit;
@@ -38,6 +38,18 @@ fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("")
 }
 
+/// Hex to bytes, or None. `reject.encoding` carries whole documents this way because a raw
+/// invalid UTF-8 byte cannot be written inside a JSON string at all — the vector file would
+/// have to be invalid itself to carry one literally.
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
 fn envelope_of(m: &Value) -> Envelope {
     Envelope {
         from: s(m, "from").into(),
@@ -50,29 +62,6 @@ fn envelope_of(m: &Value) -> Envelope {
         timestamp: m.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0),
         text: s(m, "text").into(),
     }
-}
-
-/// Base64 decode, twenty lines, so the crate list stays at the two that earn it.
-fn b64(s: &str) -> Vec<u8> {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-    let mut out = Vec::new();
-    for c in s.bytes() {
-        if c == b'=' {
-            break;
-        }
-        let Some(i) = A.iter().position(|&a| a == c) else {
-            continue;
-        };
-        acc = (acc << 6) | i as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    out
 }
 
 fn find_vectors() -> (String, String) {
@@ -200,20 +189,118 @@ fn main() {
     for c in v["reject"]["message"].as_array().unwrap_or(&vec![]) {
         let input = c.get("input").unwrap_or(c);
         let e = envelope_of(input);
+        // The recipient comes from the TOP LEVEL of the case — the caller's own idea of who
+        // it is — and falls back to `to`. It never comes from inside `input`, which is what
+        // arrived on the wire. There used to be an `s(input, "recipientDid")` step in this
+        // chain, and it would have made `wire-names-its-own-recipient` unable to fail: the
+        // runner would have supplied the very field the case exists to prove is ignored.
+        //
+        // `verifierNamesNoRecipient` says the verifier knows nobody, so it is handed "".
+        // `envelope_of` never reads `recipientDid` and `Envelope` has no such member, so in
+        // Rust the wire's self-nomination is structurally unreachable; what this case pins
+        // here is that `verify` REFUSES an empty recipient rather than helpfully substituting
+        // `self.to`, which is the JavaScript defect ported.
         let mut recipient = s(c, "recipientDid").to_string();
-        if recipient.is_empty() {
-            recipient = s(input, "recipientDid").to_string();
-        }
-        if recipient.is_empty() {
+        if recipient.is_empty() && !c["verifierNamesNoRecipient"].as_bool().unwrap_or(false) {
             recipient = e.to.clone();
         }
-        let sig = b64(s(input, "sig"));
+        // The base64 goes through agent_seam::decode_signature — the library, not a
+        // hand-rolled decoder in this file that did `continue` on anything outside the
+        // alphabet. Its error is a REFUSAL: a vector that pins the SPELLING of a signature
+        // has to fail for that reason and not because a permissive decoder happened to
+        // produce the wrong bytes.
+        let decoded = decode_signature(s(input, "sig"));
+        let refused = decoded
+            .as_ref()
+            .map(|sig| !e.verify(sig, &recipient))
+            .unwrap_or(true);
         r.check(
-            !e.verify(&sig, &recipient),
+            refused,
             &format!("reject/{}", s(c, "name")),
             &format!("ACCEPTED a message it must refuse — {}", s(c, "note")),
         );
     }
+
+    // ---- the encoding boundary: raw document BYTES, not a value
+    //
+    // This group carries the hex of a whole JSON document, because the defect it pins cannot
+    // survive a parse: a repairing reader turns an unpaired surrogate escape and an invalid
+    // UTF-8 byte alike into U+FFFD, and U+FFFD is a legitimate character every reference
+    // encodes happily — three different documents become one and sign one byte string, with
+    // nothing failing and nobody told. Go's encoding/json does that, which is why the Go
+    // reference had to grow its own parse boundary.
+    //
+    // serde_json does not, and `from_slice` is the reason this loop is three lines rather than
+    // thirty: it validates UTF-8 on the way in and refuses a lone surrogate escape while
+    // parsing. This half of the contract comes free in Rust — which is worth checking rather
+    // than assuming, because "free" is exactly the kind of guarantee a dependency bump moves.
+    for c in v["reject"]["encoding"]["accept"]
+        .as_array()
+        .unwrap_or(&vec![])
+    {
+        let name = s(c, "name");
+        let want = s(c, "canonical");
+        match unhex(s(c, "documentHex"))
+            .ok_or_else(|| "documentHex is not hex".to_string())
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string()))
+            .and_then(|doc| canonical(&doc))
+        {
+            Ok(got) => r.check(
+                got == want,
+                &format!("encoding/accept/{name}"),
+                &format!("got  {got}\n      want {want}"),
+            ),
+            Err(e) => r.check(
+                false,
+                &format!("encoding/accept/{name}"),
+                &format!(
+                    "refused a document it must render: {e}\n      {}",
+                    s(c, "why")
+                ),
+            ),
+        }
+    }
+    for c in v["reject"]["encoding"]["refuse"]
+        .as_array()
+        .unwrap_or(&vec![])
+    {
+        let refused = unhex(s(c, "documentHex"))
+            .ok_or_else(|| "documentHex is not hex".to_string())
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string()))
+            .and_then(|doc| canonical(&doc))
+            .is_err();
+        r.check(
+            refused,
+            &format!("encoding/refuse/{}", s(c, "name")),
+            &format!("ACCEPTED bytes it must refuse — {}", s(c, "why")),
+        );
+    }
+
+    // ---- reject.keystate: SKIPPED HERE, AND SAID SO.
+    //
+    // This reference implements no KeyState — there is no `resolve_op_did` in lib.rs, so there
+    // is nothing here to hold to the anti-rollback ratchet. That is a legitimate subset (a
+    // language may implement some groups and not others; tools/manifest.json says which), and
+    // it is also exactly the shape of the failure this round exists to prevent: a group nobody
+    // loops over is carried in the file and checked by nobody, and it looks identical to a
+    // group that passes.
+    //
+    // So the omission is asserted rather than assumed. The group must be PRESENT and non-empty
+    // — if it vanishes from the vectors, or arrives empty, this build goes red and somebody
+    // reads this comment — and the verdict below prints the skip by name. An implementation
+    // that later grows a KeyState resolver replaces this with a real loop.
+    let ks_skipped = v["reject"]["keystate"]["accept"]
+        .as_array()
+        .map_or(0, Vec::len)
+        + v["reject"]["keystate"]["refuse"]
+            .as_array()
+            .map_or(0, Vec::len);
+    r.check(
+        ks_skipped > 0,
+        "keystate/skipped-deliberately",
+        "reject.keystate is missing or empty — this runner skips the group ON PURPOSE and \
+         cannot skip a group that is not there",
+    );
 
     if !r.failures.is_empty() {
         println!(
@@ -234,4 +321,11 @@ fn main() {
     );
     println!("     and every message that must be refused was.");
     println!("     ({ed} ed25519 did cases; vectors: {path})");
+    println!(
+        "     SKIPPED ON PURPOSE: reject.keystate, {ks_skipped} cases — this reference implements"
+    );
+    println!(
+        "     no KeyState, so it has no resolver to hold to the ratchet. Said out loud because"
+    );
+    println!("     a group nobody loops over looks exactly like a group that passes.");
 }

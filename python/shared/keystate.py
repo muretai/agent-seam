@@ -227,6 +227,25 @@ def verified_enc_pub_pq(ks: dict | None) -> str:
     return raw
 
 
+# ------------------------------------------------------------------ reading a signature
+# The base64 SPELLING rule -- one signature, one string, trailing bits and all -- lives in
+# ONE place for the whole slice: `crypto.b64_strict`. It was briefly written out here as
+# well, and in three sibling modules beside it, which is exactly the drift the JavaScript
+# twin's note on `WBA_B64_STANDARD` warns about ("two copies of it drift"). Read a signature
+# off the wire through that function; change the rule there and every module moves at once.
+#
+# What stays HERE is the half a shared decoder cannot know: how LONG a signature may be.
+# That depends on the curve of the key this particular site is holding, so it belongs beside
+# the site, not in the decoder.
+
+#: The longest ASN.1 DER an ECDSA-P-256 signature can be: a SEQUENCE whose two INTEGERs each
+#: carry at most 33 content bytes (32, plus the 0x00 a high bit forces) behind a 2-byte
+#: tag+length, inside a 2-byte SEQUENCE header. A CEILING, not an equality -- r and s shrink
+#: when they have leading zero bytes -- and the reason no signature check in this file is a
+#: flat `== 64`: a Secure-Enclave / WebAuthn signer emits DER, not raw r||s.
+_MAX_P256_DER_SIG_BYTES = 72
+
+
 def _did_pub_hex(did: str) -> str | None:
     """The hex of the raw public key a did:key encodes (ed25519 32-byte, or p256 33-byte
     compressed), or None if it can't be resolved. Never raises."""
@@ -245,6 +264,21 @@ def _verify_pub_hex(pub_hex: str, sig: bytes, msg: bytes) -> bool:
     try:
         raw = bytes.fromhex(pub_hex)
     except Exception:
+        return False
+    # Bound the signature by the CURVE the key names, before a verifier ever sees it. The
+    # JavaScript twin pins a KeyState signature to 64 bytes flat and can afford to: its
+    # `verifyKeystate` reads an Ed25519 `rootKey` or nothing at all (`pub.length !== 32`).
+    # This module is curve-agnostic on purpose -- a P-256 Secure-Enclave COLD ROOT is the
+    # headline case in the file's own docstring -- and `crypto.p256_verify` deliberately
+    # accepts both encodings a P-256 signer emits: raw r||s (WebCrypto, 64) and ASN.1 DER
+    # (Secure Enclave / WebAuthn, ~70-72). A flat 64 here would therefore refuse every
+    # hardware-rooted KeyState this repository documents as supported, which is a NEW split
+    # in the other direction. So: the twin's rule exactly where the twin has an opinion, and
+    # a DER ceiling where it has none. Both callers -- `verify_keystate` and every link of
+    # `_verify_root_lineage` -- funnel through here, so neither can forget it.
+    if len(raw) == 32 and len(sig) != 64:
+        return False
+    if len(raw) == 33 and len(sig) > _MAX_P256_DER_SIG_BYTES:
         return False
     return crypto.verify_raw(raw, sig, msg)
 
@@ -370,7 +404,9 @@ def verify_keystate(ks: dict, expected_root_did: str | None = None,
         did_key = _did_pub_hex(root_did)
         if did_key is None:
             return False
-        sig = base64.b64decode(ks["sig"])
+        sig = crypto.b64_strict(ks.get("sig"))
+        if sig is None:
+            return False                  # one signature, ONE spelling -- crypto.b64_strict
     except Exception:
         return False
     # Authorize the rootKey. Common case: rootKey == the DID's own key (genesis root, no root
@@ -392,9 +428,36 @@ def verify_keystate(ks: dict, expected_root_did: str | None = None,
     return True
 
 
-def op_is_revoked(ks: dict, op_did: str) -> bool:
-    """True if `op_did` is in this KeyState's revocation list (a burned op-key)."""
-    return op_did in (ks.get("revokedOps") or [])
+def op_is_revoked(ks: Any, op_did: str) -> bool:
+    """True if `op_did` is in this KeyState's revocation list (a burned op-key).
+
+    A LIST, or nothing is burned. `op_did in (ks.get("revokedOps") or [])` read whatever
+    the field happened to be, and Python's `in` means four different things depending on
+    the type it lands on. Measured against the JavaScript twin (agreement table rows
+    n24-n26), on records that are AUTHENTICALLY SIGNED -- a stranger holds their own root
+    key, so they can mint these at will and `verify_keystate` says True:
+
+        revokedOps: 5              `in` raises TypeError. `resolve_op_did` catches nothing,
+                                   so the exception left a verifier documented as "pure and
+                                   total" and reached the caller. One field of the wrong
+                                   type in a correctly signed record turns a verifier off.
+        revokedOps: true           the same TypeError.
+        revokedOps: "x<opDid>y"    a SUBSTRING test: every op-key whose DID appears anywhere
+                                   in that string reads as burned, so a 62-byte string can
+                                   burn an op-key the record never named.
+        revokedOps: {"<opDid>": 1} membership over dict KEYS: burns by object shape.
+
+    The last two are the quieter half of the same defect -- they do not crash, they answer
+    the wrong question, and the answer they give is "burned", which sends the resolver to
+    the root DID and kills every message the peer signs with its live op-key.
+
+    The twin is `!!ks && Array.isArray(ks.revokedOps) && ks.revokedOps.includes(opDid)`.
+    This is that rule, and the same shape `ownerstate.is_revoked` already uses for the same
+    kind of list: a burn list you cannot enumerate is not a burn list, so it burns nothing.
+    Total on untrusted input -- a non-dict `ks` included -- because the record reaching it
+    is a stranger's."""
+    revoked = ks.get("revokedOps") if isinstance(ks, dict) else None
+    return isinstance(revoked, list) and op_did in revoked
 
 
 def op_dids_for_envelope(root_did: str, inline_keystate: dict | None,
@@ -448,6 +511,62 @@ def op_did_for_envelope(root_did: str, inline_keystate: dict | None,
         root_did, inline_keystate, pinned_keystate, now=now)[0]
 
 
+def _usable_pin(pinned: Any, root_did: str) -> bool:
+    """May `resolve_op_did` resolve THROUGH the caller's pinned KeyState? Never raises.
+
+    Two refusals, and the difference between them is the whole of the argument.
+
+    IDENTITY, always, and it costs one comparison. Nothing checked that the pin was even
+    ABOUT this identity, so `resolve_op_did(A, ..., pin_for_B)` answered B's operational
+    DID -- measured, agreement-table row p12. The caller then hands that DID to a signature
+    check, which is asked "did THIS key sign it?" and was given the wrong key to ask about;
+    nothing downstream can notice. A pin for another root is refused, and a non-dict pin
+    with it (`pinned.get` raised AttributeError on a string, where the twin answers).
+
+    SIGNATURE, but only where this function can actually reach a verdict. The pin is not
+    wire bytes -- it is the caller's stored state, written by `trust.pin_key_state` AFTER
+    verification -- so re-verifying here is defence in depth rather than necessity. Two
+    classes of legitimately pinned record cannot be judged here, and refusing them would
+    break working identities to defend against a caller that does not exist yet:
+
+      - ROOT-ROTATED (`rootKey` != the DID's own key). Its authorization is a LINEAGE, and
+        `resolve_op_did` has no lineage parameter, so `verify_keystate` answers False for
+        every one of them. The resolver would fall back to the root DID and every message
+        that peer signs with its live op-key would die as -32001 -- the exact failure this
+        file's other comments are about. The store held the lineage and checked it; this
+        function was never given it.
+      - A P-256 cold root on a node without the optional `cryptography` backend -- the
+        headline case in this module's own docstring. `crypto.verify` answers False there,
+        so re-verifying would make the resolver's answer depend on an installed package:
+        the op-key with it, the root without. That is a split INSIDE Python, which is worse
+        than the one this check closes.
+
+    Everything else -- a genesis-rooted pin on a curve this node can check -- is verified,
+    which is where the JavaScript twin's verifier can reach a verdict too (it has no store,
+    so verifying is its only option, and it refuses root rotation outright). So the two
+    agree on every pin either of them can judge, and Python declines to judge exactly the
+    records it knows more about than the twin does."""
+    if not isinstance(pinned, dict):
+        return False
+    if pinned.get("rootDid") != root_did:
+        return False
+    did_key = _did_pub_hex(root_did)
+    if did_key is None:
+        return False                      # a DID we cannot resolve authorizes nothing
+    if pinned.get("rootKey") != did_key:
+        return True                       # root-rotated: not this function's to judge
+    try:
+        curve, _pub = crypto.key_from_did(root_did)
+    except Exception:
+        return False
+    if curve == "p256" and not crypto.P256_AVAILABLE:
+        return True                       # cannot check it here; the store already did
+    # No `now`: the pin's own validity window is not what is being asked. An EXPIRED pin is
+    # still the record we hold about this identity (agreement-table row p09), and the twin
+    # omits the clock here for the same reason.
+    return verify_keystate(pinned, expected_root_did=root_did)
+
+
 def resolve_op_did(root_did: str, inline_keystate: dict | None,
                    pinned_keystate: dict | None, *, now: float) -> str:
     """The current OPERATIONAL signing DID for `root_did` — the key we treat
@@ -459,9 +578,25 @@ def resolve_op_did(root_did: str, inline_keystate: dict | None,
     function stays the pin-shaped rule: an equal-epoch fork cannot displace the
     pin. The SYNCHRONOUS reply verify (agent/outbox) still uses this, because
     that path has no post-signature supersession check — handing it the inline
-    op of a same-epoch fork would accept a burned-key reply."""
+    op of a same-epoch fork would accept a burned-key reply.
+
+    THE PIN IS GATED (`_usable_pin`), and an unusable one fails CLOSED to `root_did` rather
+    than being ignored: a pin for another identity, a pin that is not a dict at all, or a
+    genesis-rooted pin whose signature does not check out. Ignoring one would quietly
+    degrade to the no-pin behaviour that the argument exists to end, which is the opposite
+    of what a caller holding a broken pin should get.
+
+    "Pure and total" was a claim rather than a property until now: `revokedOps: 5` in an
+    authentically signed record took a TypeError out of here and into the caller. It is
+    total now — see `op_is_revoked`."""
     ks, pinned = inline_keystate, pinned_keystate
-    authoritative = pinned_keystate       # what WE pulled and verified; its burn list is trusted
+    # A pin that is not usable does not fall back to "no pin at all": it fails CLOSED to the
+    # root. Ignoring it would silently degrade to the unpinned behaviour the argument exists
+    # to end -- the caller said it holds a pin, and a pin we cannot resolve through is a
+    # reason to be more careful than a caller who holds none, not less. Same as the twin.
+    if pinned is not None and not _usable_pin(pinned, root_did):
+        return root_did
+    authoritative = pinned                # what WE pulled and verified; its burn list is trusted
     if ks and verify_keystate(ks, expected_root_did=root_did, now=now):
         # STRICTLY greater, not >=. An inline KeyState at the SAME epoch as the pin is not an
         # upgrade — it is a fork, and adopting it let a same-epoch state with a DIFFERENT opDid
@@ -492,7 +627,15 @@ def resolve_op_did(root_did: str, inline_keystate: dict | None,
     # Falling back to the authoritative opDid rather than raising keeps this function pure and
     # total; the caller's signature check then fails, which is the refusal we want.
     if authoritative is not None and op_is_revoked(authoritative, op):
-        return authoritative.get("opDid") or root_did
+        held = authoritative.get("opDid") or root_did
+        # RE-TEST what is about to be handed back. `held` was returned unconditionally, so a
+        # pin that burns its OWN opDid resolved to the very key it had just declared dead --
+        # and the line below, which exists to catch precisely that, was unreachable on this
+        # path (agreement-table row p06, where the twin answers the root and this answered
+        # the burned key). Falling back to the key the pin still stands behind is right when
+        # that key is not itself burned; when it is, nobody in the room vouches for anything
+        # and the root is the only honest answer left.
+        return root_did if op_is_revoked(authoritative, held) else held
     if pinned is not None and op_is_revoked(pinned, op):
         return root_did                   # a state that burns its OWN opDid authorizes nobody
     return op
@@ -607,8 +750,8 @@ def _verify_root_lineage(root_did: str, target: dict, lineage: list | None) -> b
             if not isinstance(rk, str) or not rk or rk in seen:
                 return False
             seen.add(rk)
-            sig = base64.b64decode(ks["sig"])
-            if not _verify_pub_hex(rk, sig, _payload(ks)):
+            sig = crypto.b64_strict(ks.get("sig"))
+            if sig is None or not _verify_pub_hex(rk, sig, _payload(ks)):
                 return False                  # each link is self-consistently root-signed
             if prev is None:
                 if rk != did_key:

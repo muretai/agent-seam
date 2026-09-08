@@ -36,10 +36,29 @@ works in the zero-dependency core. Mirrors shared/ygg.make_ygg_binding exactly.
 
 from __future__ import annotations
 
-import base64
 from typing import Callable
 
 from shared import crypto
+
+
+# ------------------------------------------------------------------ reading a signature
+# The base64 SPELLING rule -- one signature, one string, trailing bits and all -- lives in
+# ONE place for the whole slice: `crypto.b64_strict`. It was briefly written out here as
+# well, and in three sibling modules beside it, which is exactly the drift the JavaScript
+# twin's note on `WBA_B64_STANDARD` warns about ("two copies of it drift"). Read a signature
+# off the wire through that function; change the rule there and every module moves at once.
+#
+# What stays HERE is the half a shared decoder cannot know: how LONG a signature may be.
+# That depends on the curve of the key this particular site is holding, so it belongs beside
+# the site, not in the decoder.
+
+#: The longest ASN.1 DER an ECDSA-P-256 signature can be: a SEQUENCE whose two INTEGERs each
+#: carry at most 33 content bytes (32, plus the 0x00 a high bit forces) behind a 2-byte
+#: tag+length, inside a 2-byte SEQUENCE header. A CEILING, not an equality -- r and s shrink
+#: when they have leading zero bytes -- and the reason the OWNER's signature is bounded by
+#: the curve its did:key names instead of at a flat 64: a Secure-Enclave / WebAuthn root
+#: emits DER, not raw r||s. Only the DEVICE half, which is Ed25519 by construction, is 64.
+_MAX_P256_DER_SIG_BYTES = 72
 
 
 def _binding_payload(root_did: str, device_did: str, ts: float) -> bytes:
@@ -71,7 +90,14 @@ def verify_device_binding(binding: dict) -> bool:
         root_did = binding["rootDid"]
         device_did = binding["deviceDid"]
         ts = binding["ts"]
-        sig = base64.b64decode(binding["sig"])
+        sig = crypto.b64_strict(binding.get("sig"))
+        if sig is None:
+            return False
+        # No LENGTH bound on this one, deliberately: the root here is Ed25519 OR P-256, and a
+        # P-256 root is the whole reason v1 exists (a Secure Enclave / WebAuthn key signs
+        # ASN.1 DER, ~70-72 bytes, which `crypto.p256_verify` accepts alongside raw r||s --
+        # test_keybinding 2-2 pins both). A flat 64 would refuse exactly the roots this
+        # module was built for. The spelling is what was ambiguous; the length was not.
         # Payload build inside the try: canonical JSON raises on `ts: 1e400`, and a
         # verifier that never raises must not raise on a VALUE either.
         return crypto.verify(root_did, sig, _binding_payload(root_did, device_did, ts))
@@ -180,8 +206,33 @@ def verify_device_binding_v2(binding: dict, *, now: float | None = None,
             return False
         if now is not None and valid_until != 0 and now > valid_until:
             return False
-        sig = base64.b64decode(binding["sig"])
-        device_sig = base64.b64decode(binding["deviceSig"])
+        sig = crypto.b64_strict(binding.get("sig"))
+        device_sig = crypto.b64_strict(binding.get("deviceSig"))
+        if sig is None or device_sig is None:
+            return False
+        # These two are the last attacker-controlled byte strings in this function, and the
+        # twin bounds both (js/seam.mjs `verifyDeviceBindingV2`), so this side must too or a
+        # binding JavaScript refuses is one Python accepts.
+        #
+        # The DEVICE is always Ed25519 -- that is the hierarchy this module documents at the
+        # top ("device key (software Ed25519)"), and its Ed25519 DID is what appears on the
+        # wire -- so its countersignature is exactly 64 bytes and anything else is not a
+        # countersignature. Note what this narrows: a P-256 device presenting a DER
+        # countersignature verified here until now (`crypto.verify` dispatches on the DID's
+        # curve) and is refused by the twin, so it is refused here as well.
+        #
+        # The OWNER is the one signature in this file that is NOT always 64: an owner may be
+        # a Secure-Enclave / WebAuthn P-256 key emitting DER. The bound is therefore read
+        # from the owner's own did:key -- junk there raises out of `key_from_did` into the
+        # enclosing `except`, which is the same False it has always answered.
+        if len(device_sig) != 64:
+            return False
+        owner_curve, _owner_pub = crypto.key_from_did(root_did)
+        if owner_curve == "ed25519":
+            if len(sig) != 64:
+                return False
+        elif len(sig) > _MAX_P256_DER_SIG_BYTES:
+            return False
         payload = _binding_v2_payload(root_did, device_did, ts, valid_until)
         return (crypto.verify(root_did, sig, payload)
                 and crypto.verify(device_did, device_sig, payload))
