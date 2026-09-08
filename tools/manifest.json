@@ -117,6 +117,18 @@
         "reject",
         "webBotAuth(wba_vectors)"
       ]
+    },
+    {
+      "lang": "go",
+      "dir": "go",
+      "run": "cd go && go run ./conformance",
+      "groups": [
+        "canonical",
+        "numberHazards",
+        "did(ed25519)",
+        "envelope",
+        "reject.message"
+      ]
     }
   ]
 }

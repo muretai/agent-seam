@@ -30,6 +30,7 @@ of them owns the contract.
 
 ```sh
 npm test               # manifest 11 · JS conformance 76
+cd go && go run ./conformance   # Go: OK — 41 checks
 npm run test:py        # Python: closure · wire vectors 131 · web bot auth 5 accepted / 23 refused
                        #         · keybinding · cryptobox · gateway · neturl
 ```
@@ -49,20 +50,20 @@ Both diffs are empty: the Python reference is the generator of the bytes everyth
 
 ## Coverage
 
-| Vector group | JS (`js/conformance/run.mjs`) | Python (`python/test_wire_vectors.py`) |
-|---|---|---|
-| `canonical` | ✓ | ✓ |
-| `numberHazards` | read, not executed (a signer rule) | ✓ |
-| `did` | ✓ Ed25519, both directions | ✓ both curves |
-| `envelope` | ✓ + round trip | ✓ |
-| `reject.message` | ✓ | ✓ (+ `invite`, `claim`) |
-| `cardpub` | ✓ payload + verify + anti-substitution | ✓ |
-| `bindingV2` | ✓ accept + reject | ✓ |
-| `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused |
-| `relay` | — | ✓ signatures, the `\|` join order, the origin binding |
-| `binding` (v1), `domainLinkage`, `invite` | — | ✓ |
-| Web Bot Auth (`wba_vectors.json`) | ✓ 5 + 23 | ✓ (`python/test_webbotauth.py`) |
-| `cryptobox` | ✓ `open` + `encPub` | ✓ |
+| Vector group | JS (`js/conformance/run.mjs`) | Python (`python/test_wire_vectors.py`) | Go (`go/conformance`) |
+|---|---|---|---|
+| `canonical` | ✓ | ✓ | ✓ |
+| `numberHazards` | read, not executed (a signer rule) | ✓ | ✓ executed as refusals |
+| `did` | ✓ Ed25519, both directions | ✓ both curves | ✓ Ed25519, both directions |
+| `envelope` | ✓ + round trip | ✓ | ✓ + round trip |
+| `reject.message` | ✓ | ✓ (+ `invite`, `claim`) | ✓ |
+| `cardpub` | ✓ payload + verify + anti-substitution | ✓ | — |
+| `bindingV2` | ✓ accept + reject | ✓ | — |
+| `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused | — |
+| `relay` | — | ✓ signatures, the `\|` join order, the origin binding | — |
+| `binding` (v1), `domainLinkage`, `invite` | — | ✓ | — |
+| Web Bot Auth (`wba_vectors.json`) | ✓ 5 + 23 | ✓ (`python/test_webbotauth.py`) | — |
+| `cryptobox` | ✓ `open` + `encPub` | ✓ | — |
 
 ## This is where the bytes live
 
@@ -95,11 +96,28 @@ files — and `npm test` proves the manifest describes `js/seam.mjs` exactly.
 `agent-entry-serverless` vendors the whole door from agent-entry, not this repository; the seam
 reaches it inside the door.
 
+## A gap this repository knows about
+
+`canonical/key-ordering-unicode` is named "keys sort by CODE POINT, not by UTF-16 unit", and
+its keys are `z`, `a`, `群`, `A`. Every one of those is inside the Basic Multilingual Plane,
+where code-point order and UTF-16 code-unit order are the same — so the case cannot tell the
+two apart, and no other case has a key outside the BMP either. An implementation that sorted
+keys by UTF-16 code unit, which is exactly what a plain JavaScript `.sort()` does, would pass
+all 131 checks and still disagree with Python the first time a signed object carried an emoji
+or a rare CJK character as a KEY.
+
+All three references here are correct — they were checked by hand against Python on
+`{"\U00010000": 1, "\uFFFD": 2}`, and all three write `{"\uFFFD":2,"\U00010000":1}`. The gap is
+in the vectors, not in the code, and it was found by writing the third implementation, which
+is the argument for having one. Closing it means a new case in the generator and a new pin in
+every consumer, so it is a deliberate change rather than a patch.
+
 ## Adding a language
 
 The contract is `spec/seam.md` + `vectors/`; an implementation is one directory that re-derives
-them. A Rust port is `rust/` with a `cargo` crate and a test that reads `../vectors/*.json` and
-prints `OK — N checks` / exits 1 — the same shape as the two runners here. Add a row to
+them. `go/` is the worked example: 340 lines of standard library, no dependencies, a runner
+that reads `../vectors/wire_vectors.json` and prints `OK — N checks` / exits 1. A Rust port is
+`rust/` with a `cargo` crate in the same shape. Add a row to
 `tools/manifest.json` `implementations[]` and a column to the coverage table above. A language
 may implement a subset of groups; the table says which. Existing external implementations
 already vendor the vectors, so moving one in is "copy the directory, point its runner at
