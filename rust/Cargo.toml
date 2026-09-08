@@ -1,0 +1,28 @@
+[package]
+name = "agent-seam"
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "The byte contract two programs that have never met authenticate each other with — the Rust reference."
+repository = "https://github.com/muretai/agent-seam"
+
+# TWO CRATES, AND WHY. The JavaScript, Python and Go references have no dependencies at all,
+# because each of those languages ships Ed25519 and a JSON reader. Rust ships neither, so the
+# reference takes the two everybody already has rather than hand-rolling a signature scheme:
+#
+#   ed25519-dalek  the signatures. Hand-writing Ed25519 for a reference implementation would
+#                  be the one dependency worth having and the one thing worth not writing.
+#   serde_json     reading the vectors — with `arbitrary_precision`, which is not optional
+#                  here. Without it every number arrives as f64 and `1` and `1.0` become the
+#                  same value, which is precisely the difference this contract is about.
+#
+# base58 and the canonical encoder are written here, as in Go: forty lines each, and a reader
+# can follow the whole path from a public key to a signature without leaving src/lib.rs.
+[dependencies]
+ed25519-dalek = "3.0.0"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"

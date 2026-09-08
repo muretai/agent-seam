@@ -129,6 +129,18 @@
         "envelope",
         "reject.message"
       ]
+    },
+    {
+      "lang": "rust",
+      "dir": "rust",
+      "run": "cd rust && cargo run --quiet --bin conformance",
+      "groups": [
+        "canonical",
+        "numberHazards",
+        "did(ed25519)",
+        "envelope",
+        "reject.message"
+      ]
     }
   ]
 }

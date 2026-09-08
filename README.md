@@ -30,7 +30,8 @@ of them owns the contract.
 
 ```sh
 npm test               # manifest 11 · JS conformance 76
-cd go && go run ./conformance   # Go: OK — 41 checks
+cd go && go run ./conformance   # Go:     OK — 41 checks
+cd rust && cargo run --quiet --bin conformance   # Rust: OK — 41 checks
 npm run test:py        # Python: closure · wire vectors 131 · web bot auth 5 accepted / 23 refused
                        #         · keybinding · cryptobox · gateway · neturl
 ```
@@ -50,20 +51,20 @@ Both diffs are empty: the Python reference is the generator of the bytes everyth
 
 ## Coverage
 
-| Vector group | JS (`js/conformance/run.mjs`) | Python (`python/test_wire_vectors.py`) | Go (`go/conformance`) |
-|---|---|---|---|
-| `canonical` | ✓ | ✓ | ✓ |
-| `numberHazards` | read, not executed (a signer rule) | ✓ | ✓ executed as refusals |
-| `did` | ✓ Ed25519, both directions | ✓ both curves | ✓ Ed25519, both directions |
-| `envelope` | ✓ + round trip | ✓ | ✓ + round trip |
-| `reject.message` | ✓ | ✓ (+ `invite`, `claim`) | ✓ |
-| `cardpub` | ✓ payload + verify + anti-substitution | ✓ | — |
-| `bindingV2` | ✓ accept + reject | ✓ | — |
-| `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused | — |
-| `relay` | — | ✓ signatures, the `\|` join order, the origin binding | — |
-| `binding` (v1), `domainLinkage`, `invite` | — | ✓ | — |
-| Web Bot Auth (`wba_vectors.json`) | ✓ 5 + 23 | ✓ (`python/test_webbotauth.py`) | — |
-| `cryptobox` | ✓ `open` + `encPub` | ✓ | — |
+| Vector group | JS (`js/conformance/run.mjs`) | Python (`python/test_wire_vectors.py`) | Go (`go/conformance`) | Rust (`rust/conformance`) |
+|---|---|---|---|---|
+| `canonical` | ✓ | ✓ | ✓ | ✓ |
+| `numberHazards` | read, not executed (a signer rule) | ✓ | ✓ executed as refusals | ✓ executed as refusals |
+| `did` | ✓ Ed25519, both directions | ✓ both curves | ✓ Ed25519, both directions | ✓ Ed25519, both directions |
+| `envelope` | ✓ + round trip | ✓ | ✓ + round trip | ✓ + round trip |
+| `reject.message` | ✓ | ✓ (+ `invite`, `claim`) | ✓ | ✓ |
+| `cardpub` | ✓ payload + verify + anti-substitution | ✓ | — | — |
+| `bindingV2` | ✓ accept + reject | ✓ | — | — |
+| `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused | — | — |
+| `relay` | — | ✓ signatures, the `\|` join order, the origin binding | — | — |
+| `binding` (v1), `domainLinkage`, `invite` | — | ✓ | — | — |
+| Web Bot Auth (`wba_vectors.json`) | ✓ 5 + 23 | ✓ (`python/test_webbotauth.py`) | — | — |
+| `cryptobox` | ✓ `open` + `encPub` | ✓ | — | — |
 
 ## This is where the bytes live
 
@@ -115,9 +116,12 @@ every consumer, so it is a deliberate change rather than a patch.
 ## Adding a language
 
 The contract is `spec/seam.md` + `vectors/`; an implementation is one directory that re-derives
-them. `go/` is the worked example: 340 lines of standard library, no dependencies, a runner
-that reads `../vectors/wire_vectors.json` and prints `OK — N checks` / exits 1. A Rust port is
-`rust/` with a `cargo` crate in the same shape. Add a row to
+them. `go/` and `rust/` are the worked examples: each is one library file plus a runner that
+reads `../vectors/wire_vectors.json` and prints `OK — N checks` / exits 1, and each was written
+from the spec and the vectors alone. Go needs nothing but its standard library; Rust takes
+`ed25519-dalek` for the signatures and `serde_json` with `arbitrary_precision` for reading the
+vectors, because Rust ships neither, and `rust/Cargo.toml` says why in the file. Add a row to
+`tools/manifest.json` `implementations[]` and a column to the coverage table above. Add a row to
 `tools/manifest.json` `implementations[]` and a column to the coverage table above. A language
 may implement a subset of groups; the table says which. Existing external implementations
 already vendor the vectors, so moving one in is "copy the directory, point its runner at
