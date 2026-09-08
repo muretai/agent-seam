@@ -1,19 +1,22 @@
-# The Agent Entry seam — the wire contract
+# The seam — the bytes an implementation must reproduce
 
 **The bytes every implementation must reproduce — and refuse.**
 
-Status: v0, extracted 2026-09-06 from Agent Entry v1 (`agent-entry/spec/v1.md`, MIT) and from
-the reference implementations; since 2026-09-07 this repository (`agent-seam`) is the home of the
-contract and of both references, and every other repository vendors a pinned copy. Licence: MIT,
-the same as the reference implementations here. You may implement this seam in any software
+Status: v0. The rules were first written down inside two implementations of them — a JavaScript
+door and a Python node — and were extracted on 2026-09-06; since 2026-09-07 this repository
+(`agent-seam`) is the home of the contract and of both references, and everything that
+reproduces these bytes vendors a pinned copy. The contract belongs to no implementation.
+Licence: MIT, the same as the references here. You may implement this seam in any software
 under any licence.
 
 This document names what is *pinned*: for each group of the golden vectors
 (`vectors/wire_vectors.json`, `vectors/wba_vectors.json`) it states the rule in a few sentences
-and names the function that is the reference in each language. It does not specify the door
-(the HTTP endpoint, its ladder of checks, its store, its rate limits) — that is
-[`agent-entry/spec/v1.md`](https://github.com/muretai/agent-entry/blob/main/spec/v1.md) §4. The
-door consumes this contract; it does not extend it.
+and names the function that is the reference in each language. It specifies bytes and nothing
+else: what an endpoint does with a message it has verified — which routes it serves, what
+ladder of checks it runs, what it stores, what it refuses to answer twice — is that
+implementation's own business, and one such endpoint is specified in
+[`agent-entry/spec/v1.md`](https://github.com/muretai/agent-entry/blob/main/spec/v1.md) §4.
+An implementation consumes this contract; it does not extend it.
 
 Two rules apply to every section:
 

@@ -741,9 +741,9 @@ def test_fetch_policy() -> None:
 def test_request_vectors() -> None:
     """vectors/wba_vectors.json re-derived through verify_request, case by case.
 
-    The vectors are the CROSS-IMPLEMENTATION pin (T107): the Agent Entry's JS twin
-    re-runs this same file through its own RFC 9421 subset, so a vector this module
-    accepts and that one refuses (or vice versa) is a red suite, not a field report.
+    The vectors are the CROSS-IMPLEMENTATION pin: the JavaScript reference re-runs this
+    same file through its own RFC 9421 subset, so a vector this module accepts and that
+    one refuses (or vice versa) is a red suite, not a field report.
     This leg is what stops the FILE drifting from the Python module: the generator
     (tools/gen_wba_vectors.py) derives every case from the pinned fixture seed, and
     this test refuses a file the live verifier disagrees with."""

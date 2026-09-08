@@ -1,8 +1,8 @@
 {
   "name": "@muretai/agent-seam",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
-  "description": "The seam of Agent Entry — the wire contract every implementation must reproduce: canonical JSON, did:key, the six signed fields, card envelopes, device binding, Web Bot Auth verify, cryptobox — as golden vectors plus reference implementations in JS and Python. Zero dependencies.",
+  "description": "The byte contract two programs that have never met authenticate each other with: canonical JSON, did:key, the six signed fields, the signed Agent Card envelope, device-key binding, Web Bot Auth verify, cryptobox. Golden vectors plus reference implementations in JavaScript and Python. Zero dependencies. MIT.",
   "type": "module",
   "license": "MIT",
   "author": "Muretai",

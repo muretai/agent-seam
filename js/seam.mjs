@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 /*
- * agent-seam/js/seam.mjs — the seam of Agent Entry: its wire/crypto layer, as ONE file with no
- * dependencies. THIS IS ITS HOME. Edit it here; every consumer re-vendors.
+ * agent-seam/js/seam.mjs — the seam: the byte contract two programs that have never met
+ * authenticate each other with, as ONE file with no dependencies. It belongs to no
+ * implementation. THIS IS ITS HOME. Edit it here; every consumer re-vendors.
  *
  * WHO CARRIES A COPY. The Agent Entry door (`@muretai/agent-entry`, muretai-agent-entry.mjs)
  * carries the block between the `CANONICAL JSON` banner and `// ---- end of the seam` verbatim,

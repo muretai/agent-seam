@@ -1,18 +1,22 @@
 # agent-seam
 
-**The seam of [Agent Entry](https://github.com/muretai/agent-entry): the wire contract every
-implementation must reproduce, as golden vectors plus reference implementations in JavaScript
-and Python. Zero dependencies. MIT.**
+**The byte contract two programs that have never met authenticate each other with, as golden
+vectors plus reference implementations in JavaScript and Python. Zero dependencies. MIT.**
 
-An Agent Entry lets a website recognise an AI agent it has never met and answer it in the same
-request. Two things make that work across languages, machines and years: a small set of byte
-contracts (canonical JSON, `did:key`, six signed fields, a signed card envelope, device
-binding, Web Bot Auth, cryptobox), and the fact that every implementation — the JavaScript
-door, the Python node, Swift, Kotlin, PHP — reproduces exactly the same bytes. No dependency
-manager sees that coupling, and when it breaks nothing throws: signatures simply stop verifying.
-This repository is where that seam lives, on its own, under one licence. **It is the home, not
-a copy**: the JavaScript and the Python reference are edited here, and every other repository
-carries a pinned copy it took from here.
+Two programs that have never met can still prove who they are to each other, if they agree on
+bytes: canonical JSON, `did:key`, six signed fields, a signed Agent Card envelope, device-key
+binding, the Web Bot Auth verify side, a sealed box. That agreement is this repository. It is
+not a library either side calls — it is the shape of what goes over the wire, written down
+once, with vectors that say what is right and what must be refused.
+
+The coupling is invisible and unforgiving. No dependency manager can see it, and when it breaks
+nothing throws: signatures simply stop verifying, and the only diagnostic anyone gets is
+"signature verification failed". So the contract lives on its own, belongs to no implementation,
+and every implementation is held to it the same way.
+
+**This repository is the home, not a copy.** The JavaScript and the Python reference are edited
+here; everything that reproduces these bytes carries a pinned copy it took from here, and none
+of them owns the contract.
 
 - [`spec/seam.md`](spec/seam.md) — the contract, one section per vector group
 - [`vectors/`](vectors/) — the golden vectors (`wire_vectors.json`, `wba_vectors.json`)
