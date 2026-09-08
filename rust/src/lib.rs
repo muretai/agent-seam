@@ -183,7 +183,27 @@ pub fn b58_encode(data: &[u8]) -> String {
     out
 }
 
+/// Bounds what [`b58_decode`] will even look at. Every legitimate base58 here is far under it —
+/// a `did:key` is about 48 characters — and it changes NO VERDICT: the loop below is quadratic
+/// in the input length, and a string long enough to be slow decodes to far more than the 34
+/// bytes [`public_key_from_did`] demands, so an over-long DID was already refused. What it buys
+/// is CPU. `Envelope::verify` reaches this through `from`, which is attacker-written and bounded
+/// only by the body limit, BEFORE any signature is checked.
+///
+/// 512, the same constant as `shared/crypto._MAX_B58_LEN`, `js/seam.mjs` `MAX_B58_LEN` and Go's
+/// `MaxBase58Len`, so all four references refuse the same strings for the same reason at the
+/// same size. Measured on this build: 400 characters costs 869 µs in debug and the quadratic
+/// only becomes seconds five orders of magnitude further out — real, and further out than it
+/// was reported to be.
+pub const MAX_BASE58_LEN: usize = 512;
+
 pub fn b58_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() > MAX_BASE58_LEN {
+        return Err(format!(
+            "base58: input is {} characters, over the {MAX_BASE58_LEN}-character bound",
+            s.len()
+        ));
+    }
     let mut bytes: Vec<u8> = Vec::new();
     for c in s.bytes() {
         let mut carry = B58

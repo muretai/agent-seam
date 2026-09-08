@@ -35,11 +35,13 @@ column below says which runner in this repository checks each group today.
 | `canonical` | canonical JSON bytes | `canonicalJSON` | `crypto.canonical` |
 | `numberHazards` | a signer rule (read, never executed) | counted | asserted |
 | `did` | did:key for Ed25519 (and P-256) | `didFromPublicKeyHex`, `publicKeyHexFromDid` | `crypto.did_from_public`, `public_from_did` |
+| `reject.did` | did:key strings a decoder must refuse | `publicKeyHexFromDid` | `crypto.public_from_did` |
 | `envelope` | the six signed fields | `signingPayload`, `signEnvelope`, `verifyEnvelope` | `crypto.signing_payload`, `sign_envelope`, `verify_envelope` |
 | `reject.message` | what a receiver must refuse | `verifyEnvelope` | `crypto.verify_envelope` |
-| `reject.encoding` | raw document BYTES a parser must refuse | a fatal `TextDecoder`, then `canonicalBytes` | `json.loads(bytes)`, then `crypto.canonical` |
+| `reject.encoding` | raw document BYTES a parser must refuse | `canonicalFromJSON` | `crypto.canonical_from_json` |
 | `reject.keystate` | the anti-rollback ratchet | `resolveOpDid(root, inline, now, {pinned})` | `keystate.resolve_op_did` |
 | `cardpub` | the signed Agent Card envelope | `cardEnvelopePayload`, `verifyCardEnvelope` | `cardpub.verify_card_envelope` |
+| `reject.cardpub` | card envelopes a verifier must refuse | `verifyCardEnvelope` | `cardpub.verify_card_envelope` |
 | `bindingV2` | device-key binding v2 | `verifyDeviceBindingV2` | `keybinding.verify_device_binding_v2` |
 | `binding` (v1) | the older binding payload | — | `keybinding` |
 | `ownerState` | owner revocation state | — (`verifyKeystate` covers KeyState v1) | `ownerstate` |
@@ -71,9 +73,10 @@ containing an unpaired surrogate — U+D800–U+DFFF standing alone, whether it 
 or as a `\ud800` escape, and in a **key** exactly as in a value. `\ud83d\udc26` is a
 well-formed pair — high then low, adjacent — so it is one character, U+1F426, and canonicalizes
 to those bytes literally; `\udc00\ud800` is two lone surrogates that merely look like a pair,
-and is refused. `reject.encoding` pins seven such documents and three that must still render,
-and it carries every one of them as the **hex of the raw document bytes**, because a raw invalid
-byte cannot be written inside a JSON string at all.
+and is refused. A canonicaliser MUST also refuse a document that carries a **byte order mark**,
+and MUST NOT read a document in any encoding but UTF-8 (§1.1.1). `reject.encoding` pins nine such
+documents and four that must still render, and it carries every one of them as the **hex of the
+raw document bytes**, because a raw invalid byte cannot be written inside a JSON string at all.
 
 The refusal has to happen at the **parse boundary**, before there is a value to inspect, and
 this is the part implementations get wrong in the same direction every time. The tempting
@@ -89,8 +92,9 @@ repair they are one, and they sign one identical byte string. So a signature mad
 carrying a literal U+FFFD *also authenticates*, at a repairing receiver, a message carrying
 `\ud800` instead — content substitution under a signature that verifies, with nothing failing
 and nobody told. That is strictly worse than a message that is rejected. Measured on the pinned
-cases: a repairing reader collapses the seven refused documents to four distinct byte strings,
-and four of the seven become the *accepted* `literal-replacement-char` document exactly.
+cases: a repairing reader collapses the seven character-level refused documents to four distinct
+byte strings, and four of the seven become the *accepted* `literal-replacement-char` document
+exactly.
 
 The corollary is that a literal U+FFFD must still canonicalize. It is an ordinary character; it
 is the REPAIR that is forbidden, not the code point, and an implementation that refuses U+FFFD
@@ -108,11 +112,71 @@ gets both from `serde_json::from_slice`. JavaScript needs two: a **fatal** `Text
 bytes, and `assertEncodable` inside `canonicalBytes` for the escapes, which are pure ASCII and
 which no decoder can see.
 
+**Each reference owns the whole boundary in one named function, and a caller uses that function
+rather than assembling one.** They are `seam.CanonicalFromJSON` (Go), `canonicalFromJSON`
+(JavaScript), `crypto.canonical_from_json` (Python) and `serde_json::from_slice` followed by
+`canonical` (Rust). This is a rule about where the guard lives, not a convenience: the recipe
+this document used to give JavaScript callers — "a fatal `TextDecoder`, then `canonicalBytes`" —
+is wrong, in a way nobody following it could see, and §1.1.1 is what it got wrong.
+
+### 1.1.1 The mark, and the encoding
+
+RFC 8259 §8.1: "Implementations MUST NOT add a byte order mark to the beginning of a
+networked-transmitted JSON text." A canonicaliser here MUST refuse one rather than strip it, and
+MUST NOT read a document in UTF-16 or UTF-32, marked or unmarked. **The refusal is the same rule
+as the surrogates above, one layer out.** `EF BB BF {"a":1}` and `{"a":1}` are two distinct wire
+documents; strip the mark and they canonicalize to one byte string, so a signature over either
+authenticates the other at a stripping receiver — content its signer never saw, under a
+signature that verifies, with nothing failing and nobody told. The pinned pair is
+`reject.encoding.refuse/leading-utf8-bom` and `reject.encoding.accept/same-document-unmarked`,
+and they exist together because the second is what says the refusal is about the mark and not
+about the document.
+
+Measured across the four references before 0.3.1, this split the contract two-and-two. Python's
+`json.loads` on *bytes* runs `json.detect_encoding` and read the marked document as `utf-8-sig`;
+JavaScript's `TextDecoder('utf-8', {fatal: true})` STRIPPED it, because `ignoreBOM` defaults to
+false and the flag means *do not strip*; Go's `encoding/json` and Rust's
+`serde_json::from_slice` both refused at the first byte. So Go and Rust already stated the rule
+and the other two moved: Python grew `crypto.canonical_from_json`, JavaScript grew
+`canonicalFromJSON` with `ignoreBOM: true` and an explicit refusal. The same decision had
+already been made once in this family, for the same reason, in agent-entry's
+`conformance/receptor-check.mjs`.
+
+Python's boundary was additionally **encoding-autodetecting**: `detect_encoding` reads UTF-16 and
+UTF-32, with or without a mark, from NUL bytes in the first four. That is not reachable through
+any wire ingress in this repository — `protocol.loads`, `invite`, `jws` and `webbotauth` all
+`.decode("utf-8")` explicitly and raise on anything else — but it *was* reachable through the
+path this document named, which is the path an implementer copies. `reject.encoding.refuse/
+utf16le-no-bom` pins it, and it is a separate case from the mark because it is a separate clause
+of the guard.
+
 ## 2. Keys and DIDs
 
 An identity is a 32-byte Ed25519 seed. Its DID is `did:key:z` + base58btc(multicodec prefix
 `0xed 0x01` + the 32-byte public key). P-256 keys use their own multicodec prefix and are never
-envelope signers. Decoding must refuse a wrong prefix, a wrong length and an over-long string.
+envelope signers. Decoding MUST refuse a wrong multicodec prefix and MUST refuse anything but
+exactly 34 decoded bytes; `reject.did` pins both, from the side that can fail.
+
+Both cases there are chosen so that ONE missing check is enough to fail them, because a case two
+independent checks both refuse says nothing about either. `x25519-multicodec` is 34 bytes — the
+right length, the wrong prefix — so a decoder that only measures accepts it and hands back
+somebody's X25519 key as a verification key. `ed25519-prefix-31-byte-key` and
+`ed25519-prefix-33-byte-key` are the right prefix and the wrong length, which a decoder that
+checks the multicodec and slices `[2:]` returns as 31 or 33 bytes.
+
+**A decoder must also bound how long a base58 string it will look at, and that bound is not a
+verdict.** All four references cap it at 512 characters (`MAX_B58_LEN`, `_MAX_B58_LEN`,
+`MaxBase58Len`, `MAX_BASE58_LEN`), and no vector pins it, deliberately: no over-long base58
+string can decode to 34 bytes — a longer string is a larger integer, and leading `1`s only add
+leading zero bytes — so the length rule above refuses every one of them with or without a cap. A
+`reject.did` case for it would be green in an implementation that has no cap at all, which is a
+check that cannot fail. What the cap buys is CPU. The decode loop is quadratic and it runs on
+`from` before any signature is checked, so an unbounded string is unauthenticated CPU exhaustion
+at the door every message goes through: measured in Go, 256 KB of base58 costs 1.19 s and 1 MiB
+— inside `shared/httputil`'s own `MAX_BODY_BYTES` — costs 13.9 s. (A 400-character DID costs 13
+microseconds there and 869 in Rust; the defect is real and further out than it was first
+reported to be.) Cost is a property of an implementation, not of the bytes, so it is stated here
+and pinned nowhere.
 
 ### 2.1 A verification key must be of prime order, and so must `R`
 
@@ -242,6 +306,20 @@ wire carries it (an integer; a verifier still reads an older float envelope). As
 the card does not name must be refused (anti-substitution). The 6-hour freshness window and
 the "sign at most hourly" rule are the door's (v1 §4.3, AE-12/AE-13).
 
+**The signature is the whole artifact, and `reject.cardpub` is what says so.** A signed card is
+the only proof that a DID belongs to an origin, and every consumer treats a non-null return as
+identity proven — so a verifier that returns the card without checking the signature proves
+nothing while looking exactly like one that does. Until 0.3.1 nothing here could tell them
+apart: `cardpub` was two positive cases plus an anti-substitution case, and anti-substitution is
+a string comparison (`expectedDid != card.did`) that runs perfectly well inside a verifier with
+no crypto in it. Measured: `verifyCardEnvelope` cut down to a shape check plus `return card`
+kept the JavaScript suite green, and `verify_card_envelope` with its `crypto.verify` removed
+kept the Python one green. Three refusals now pin it — a signature with one base64 character
+changed (still canonical base64, still 64 bytes, so only the Ed25519 check refuses it), an
+envelope signed by a different key under the honest `did`, and a genuine signature over a card
+body that was edited afterwards. `expectedDid` is the CALLER's, carried at the top level of the
+case, never read out of the envelope.
+
 ## 5. Device-key binding v2
 
 `typ: "muretai/devicebinding/2"`. An owner (root) key and a device key each sign the binding
@@ -249,6 +327,16 @@ payload — canonical JSON of the binding's fields — so a device can prove it 
 without the owner's seed leaving the owner. Verification is judged at a stated `now` against
 `validUntil`; `bindingV2.reject` lists what must be refused (a foreign device DID, a broken
 countersignature, an expired binding, …). The v1 `binding` group is kept for the older payload.
+
+**`expectedDeviceDid` is the anti-copy pin, and it comes from the caller.** A binding is a
+public artifact: anyone who has seen one can attach it to their own message and be read as the
+owner's account at every receiver. So the caller states which device it believes it is talking
+to, and the binding must be about that device — the belt over the piecewise checks. Every case
+carries `expectedDeviceDid` at its top level and a runner MUST read it from there and never from
+the binding, which is asking the attacker who the attacker is. `bindingV2.reject/
+binding-lifted-to-another-device` is the case: the binding is byte-identical to the accepted
+`no-expiry` one and only the caller's expectation differs, so its refusal can be nothing but the
+pin.
 
 ## 6. KeyState v1 and OwnerState
 
@@ -276,12 +364,20 @@ The memory is a **pinned** KeyState — one for this same root that the caller k
 earlier, verified contact — and with it the resolver is a ratchet. The rules, which
 `reject.keystate` pins case for case:
 
-1. **The pin is verified before it is trusted**, against the root DID. A pin that was supplied
-   and does not verify is a broken store, not a first contact, so it fails closed to the root
-   rather than degrading to the unpinned answer the parameter exists to end. The validity
-   *window* is deliberately not applied to the pin: `notAfter` says a record may no longer
-   authorize a key, not that we never saw it, and expiring the pin would hand the thief his
-   replay back on a clock.
+1. **The pin is verified before it is trusted**, against the root DID, and an INLINE record is
+   verified against `checkNow`'s validity window. A pin that was supplied and does not verify is
+   a broken store, not a first contact, so it fails closed to the root rather than degrading to
+   the unpinned answer the parameter exists to end. An inline record outside its own
+   `notBefore`/`notAfter` does not verify, so it delegates nothing and the answer is the root —
+   the same verdict, for the same reason, as a record that does not verify at all.
+   `reject.keystate.accept/expired-window` and `/not-yet-valid-window` pin the two ends, and
+   they are two cases because `now > notAfter` and `now < notBefore` are two comparisons an
+   implementation can carry one of. (Until 0.3.1 every record in the group carried
+   `notBefore: 0` and `notAfter: null`, so deleting the window check outright left both
+   references fully green — this rule was stated here and tested nowhere.)
+   The validity *window* is deliberately not applied to the pin: `notAfter` says a record may no
+   longer authorize a key, not that we never saw it, and expiring the pin would hand the thief
+   his replay back on a clock.
 2. **An inline record displaces the pin only at a STRICTLY greater epoch, and only under the
    same `rootKey`.** Equal is not an upgrade, it is a fork — two histories at one epoch — and
    the one we verified ourselves is the one we keep. Identical content makes `>` and `>=` the

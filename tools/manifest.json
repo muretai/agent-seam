@@ -88,11 +88,13 @@
       "groups": [
         "canonical",
         "did",
+        "reject.did",
         "envelope",
         "reject.message",
         "reject.encoding",
         "reject.keystate",
         "cardpub",
+        "reject.cardpub",
         "cryptobox",
         "bindingV2",
         "webBotAuth(wba_vectors)"
@@ -106,6 +108,7 @@
         "canonical",
         "numberHazards",
         "did",
+        "reject.did",
         "envelope",
         "binding",
         "bindingV2",
@@ -114,6 +117,7 @@
         "cryptobox",
         "invite",
         "cardpub",
+        "reject.cardpub",
         "domainLinkage",
         "webBotAuth",
         "reject",
@@ -130,14 +134,16 @@
         "canonical",
         "numberHazards",
         "did(ed25519)",
+        "reject.did",
         "envelope",
         "reject.message",
         "reject.encoding"
       ],
       "skips": [
-        "reject.keystate"
+        "reject.keystate",
+        "reject.cardpub"
       ],
-      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState in this reference to hold to the ratchet."
+      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT and non-empty in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState and no card envelope in this reference to hold to either."
     },
     {
       "lang": "rust",
@@ -147,14 +153,16 @@
         "canonical",
         "numberHazards",
         "did(ed25519)",
+        "reject.did",
         "envelope",
         "reject.message",
         "reject.encoding"
       ],
       "skips": [
-        "reject.keystate"
+        "reject.keystate",
+        "reject.cardpub"
       ],
-      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState in this reference to hold to the ratchet."
+      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT and non-empty in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState and no card envelope in this reference to hold to either."
     }
   ]
 }

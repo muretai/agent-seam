@@ -154,6 +154,34 @@ fn main() {
         );
     }
 
+    // ---- reject.did: the other direction of the codec above.
+    //
+    // `did` is ten positive round-trips, and a decoder that answered `raw[2..]` for anything at
+    // all would pass every one of them — so spec §2's two verdict rules, the multicodec and the
+    // length, are pinned here from the side that can fail. `x25519-multicodec` is the sharp
+    // one: THIRTY-FOUR BYTES, exactly what an ed25519 `did:key` decodes to, so only the PREFIX
+    // check refuses it and a decoder that measures alone hands back somebody's X25519 key as a
+    // verification key.
+    //
+    // The group carries no over-long case, deliberately: no over-long base58 string can decode
+    // to 34 bytes (a longer string is a larger integer, and leading '1's only add leading zero
+    // bytes), so the length rule refuses every one of them with or without a cap — such a
+    // vector would be green in an implementation that has none. The cap is in lib.rs as
+    // MAX_BASE58_LEN regardless, because it buys CPU rather than a verdict.
+    let did_rejects = v["reject"]["did"].as_array().cloned().unwrap_or_default();
+    r.check(
+        !did_rejects.is_empty(),
+        "did/reject/group-present",
+        "reject.did is missing or empty — this runner loops over it and cannot loop over nothing",
+    );
+    for c in &did_rejects {
+        r.check(
+            public_key_from_did(s(c, "did")).is_err(),
+            &format!("did/reject/{}", s(c, "name")),
+            &format!("DECODED a did:key it must refuse — {}", s(c, "why")),
+        );
+    }
+
     // ---- the signing envelope: the exact bytes that are signed
     for c in v["envelope"].as_array().unwrap_or(&vec![]) {
         let want = s(c, "signingPayload");
@@ -302,6 +330,19 @@ fn main() {
          cannot skip a group that is not there",
     );
 
+    // ---- reject.cardpub: SKIPPED HERE TOO, AND SAID SO, by the same discipline and for the
+    // same reason. There is no card envelope in lib.rs — the README's coverage table has marked
+    // `cardpub` as "—" for Rust since this reference was written — so there is nothing here to
+    // hold to it. The group is new in 0.3.1 and closes the largest hole this repository had, so
+    // it is worth saying plainly that Rust is not one of the implementations closing it.
+    let card_skipped = v["reject"]["cardpub"].as_array().map_or(0, Vec::len);
+    r.check(
+        card_skipped > 0,
+        "cardpub/skipped-deliberately",
+        "reject.cardpub is missing or empty — this runner skips the group ON PURPOSE and \
+         cannot skip a group that is not there",
+    );
+
     if !r.failures.is_empty() {
         println!(
             "\nFAILED — {} of {} checks:\n",
@@ -324,8 +365,9 @@ fn main() {
     println!(
         "     SKIPPED ON PURPOSE: reject.keystate, {ks_skipped} cases — this reference implements"
     );
+    println!("     no KeyState, so it has no resolver to hold to the ratchet; and reject.cardpub,");
     println!(
-        "     no KeyState, so it has no resolver to hold to the ratchet. Said out loud because"
+        "     {card_skipped} cases — no card envelope here either. Said out loud because a group"
     );
-    println!("     a group nobody loops over looks exactly like a group that passes.");
+    println!("     nobody loops over looks exactly like a group that passes.");
 }

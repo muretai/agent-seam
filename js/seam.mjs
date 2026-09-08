@@ -193,6 +193,49 @@ export function canonicalBytes(value) {
   return Buffer.from(s, 'utf8');
 }
 
+/** `fatal: true` refuses invalid UTF-8 instead of substituting U+FFFD. `ignoreBOM: true` does
+ *  NOT mean "ignore a BOM" — it means "do not STRIP one", which is the half that matters, and
+ *  the flag's name has cost this family a day before. The default decoder silently removes a
+ *  leading U+FEFF, so `EF BB BF {"a":1}` parsed cleanly here and was refused by Go and Rust:
+ *  the same bytes, conformant on two references and not on the other two. */
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** The five byte order marks, longest first — UTF-32-LE's begins with UTF-16-LE's. */
+const JSON_BOMS = [[0x00, 0x00, 0xfe, 0xff], [0xff, 0xfe, 0x00, 0x00],
+  [0xef, 0xbb, 0xbf], [0xfe, 0xff], [0xff, 0xfe]];
+
+/**
+ * Raw document BYTES in, the exact bytes to sign out — the whole supported path for a document
+ * read off a wire, and the twin of Go's `seam.CanonicalFromJSON`, Rust's
+ * `serde_json::from_slice` + `canonical`, and Python's `crypto.canonical_from_json`.
+ *
+ * THREE DOORS, AND EACH ONE IS LOAD-BEARING. The BOM check below, because RFC 8259 §8.1 says a
+ * networked JSON text carries no byte order mark and because stripping one makes
+ * `EF BB BF {"a":1}` and `{"a":1}` — two distinct wire documents — sign ONE byte string, which
+ * is the lone-surrogate collision of 0.3.0 wearing a different hat: content substitution under
+ * a signature that verifies. The fatal decode, because `Buffer.toString('utf8')` REPAIRS an
+ * invalid byte to U+FFFD, and U+FFFD is a character this reference encodes happily, so the
+ * evidence is gone one line before the bytes get signed. And `assertEncodable` inside
+ * `canonicalBytes`, because a lone surrogate can ride as a `\ud800` ESCAPE — pure ASCII, which
+ * no decoder can see.
+ *
+ * Callers used to be told to assemble this themselves ("a fatal TextDecoder, then
+ * canonicalBytes"), and a recipe in a document is not a guard: the one caller who reaches for
+ * the default decoder gets a boundary that repairs, and nothing anywhere says so.
+ */
+export function canonicalFromJSON(raw) {
+  const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  for (const bom of JSON_BOMS) {
+    if (bytes.length >= bom.length && bom.every((b, i) => bytes[i] === b)) {
+      throw new SyntaxError(
+        `json: document begins with a byte order mark (${Buffer.from(bom).toString('hex')}) — `
+        + 'RFC 8259 §8.1 forbids one, and stripping it makes two distinct documents sign one '
+        + 'byte string');
+    }
+  }
+  return canonicalBytes(JSON.parse(UTF8_STRICT.decode(bytes)));
+}
+
 /** Refuse lone surrogates. Python's `.encode("utf-8")` RAISES on them; Node silently
  *  substitutes U+FFFD, which would sign different bytes than the sender believes. */
 function assertEncodable(s) {

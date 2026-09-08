@@ -29,17 +29,18 @@ of them owns the contract.
 ## Run
 
 ```sh
-npm test               # manifest 17 · JS conformance 105
-cd go && go run ./conformance   # Go:     OK — 55 checks
-cd rust && cargo run --quiet --bin conformance   # Rust: OK — 55 checks
-npm run test:py        # Python: closure 220 · wire vectors 159 · web bot auth 5 accepted / 25 refused
+npm test               # manifest 17 · JS conformance 118
+cd go && go run ./conformance   # Go:     OK — 63 checks
+cd rust && cargo run --quiet --bin conformance   # Rust: OK — 63 checks
+npm run test:py        # Python: closure 220 · wire vectors 180 · web bot auth 5 accepted / 25 refused
                        #         · keybinding · cryptobox · gateway · neturl
                        #         · ed25519 backend agreement 313 (library vs pure-python)
 ```
 
-Go and Rust print one line more than they used to: `reject.keystate` SKIPPED ON PURPOSE. Neither
-implements KeyState, and a group nobody loops over looks exactly like a group that passes — so
-each asserts the group is present and says out loud that it is not checking it.
+Go and Rust print two skips: `reject.keystate` and `reject.cardpub`, SKIPPED ON PURPOSE.
+Neither implements KeyState or the card envelope, and a group nobody loops over looks exactly
+like a group that passes — so each asserts the group is present and says out loud that it is not
+checking it.
 
 Nothing dials out, nothing needs an account, and nothing here reads another checkout: this
 repository's tests are its own. Python ≥ 3.9; `cryptography` is needed only for `cryptobox` and
@@ -61,12 +62,14 @@ Both diffs are empty: the Python reference is the generator of the bytes everyth
 | `canonical` | ✓ | ✓ | ✓ | ✓ |
 | `numberHazards` | read, not executed (a signer rule) | ✓ | ✓ executed as refusals | ✓ executed as refusals |
 | `did` | ✓ Ed25519, both directions | ✓ both curves | ✓ Ed25519, both directions | ✓ Ed25519, both directions |
+| `reject.did` | ✓ 3 | ✓ 3 + a base58 control | ✓ 3 | ✓ 3 |
 | `envelope` | ✓ + round trip | ✓ | ✓ + round trip | ✓ + round trip |
 | `reject.message` | ✓ | ✓ (+ `invite`, `claim`) | ✓ | ✓ |
-| `reject.encoding` | ✓ fatal `TextDecoder` + `canonicalBytes` | ✓ `json.loads(bytes)` + `crypto.canonical` | ✓ `seam.CanonicalFromJSON` | ✓ `serde_json::from_slice` |
-| `reject.keystate` | ✓ `resolveOpDid(…, { pinned })`, 8 accept + 3 refuse | ✓ `keystate.resolve_op_did` | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name |
+| `reject.encoding` | ✓ `canonicalFromJSON`, 4 accept + 9 refuse | ✓ `crypto.canonical_from_json` | ✓ `seam.CanonicalFromJSON` | ✓ `serde_json::from_slice` |
+| `reject.keystate` | ✓ `resolveOpDid(…, { pinned })`, 10 accept + 3 refuse | ✓ `keystate.resolve_op_did` | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name |
 | `cardpub` | ✓ payload + verify + anti-substitution | ✓ | — | — |
-| `bindingV2` | ✓ accept + reject | ✓ | — | — |
+| `reject.cardpub` | ✓ 3 | ✓ 3 + a fail-open meta-control | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name |
+| `bindingV2` | ✓ 2 accept + 4 reject, `expectedDeviceDid` from the case | ✓ same | — | — |
 | `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused | — | — |
 | `relay` | — | ✓ signatures, the `\|` join order, the origin binding | — | — |
 | `binding` (v1), `domainLinkage`, `invite` | — | ✓ | — | — |
@@ -111,7 +114,7 @@ its keys are `z`, `a`, `群`, `A`. Every one of those is inside the Basic Multil
 where code-point order and UTF-16 code-unit order are the same — so the case cannot tell the
 two apart, and no other case has a key outside the BMP either. An implementation that sorted
 keys by UTF-16 code unit, which is exactly what a plain JavaScript `.sort()` does, would pass
-all 159 checks and still disagree with Python the first time a signed object carried an emoji
+all 180 checks and still disagree with Python the first time a signed object carried an emoji
 or a rare CJK character as a KEY.
 
 All three references here are correct — they were checked by hand against Python on

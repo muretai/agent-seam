@@ -1,6 +1,6 @@
 {
   "name": "@muretai/agent-seam",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "The byte contract two programs that have never met authenticate each other with: canonical JSON, did:key, the six signed fields, the signed Agent Card envelope, device-key binding, Web Bot Auth verify, cryptobox. Golden vectors plus four independent reference implementations — JavaScript, Python, Go, Rust. Zero dependencies in three of them. MIT.",
   "type": "module",

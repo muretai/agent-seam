@@ -578,6 +578,64 @@ def canonical(payload: dict[str, Any]) -> bytes:
 _canonical = canonical
 
 
+#: The five byte order marks `json.detect_encoding` names an encoding from. Longest first:
+#: UTF-32-LE's mark BEGINS with UTF-16-LE's, so a shorter prefix tested first would report
+#: the wrong encoding in the refusal.
+_JSON_BOMS = (b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00", b"\xef\xbb\xbf", b"\xfe\xff", b"\xff\xfe")
+
+
+def canonical_from_json(raw: bytes) -> bytes:
+    """Raw document BYTES in, the exact bytes to sign out — the whole supported path for a
+    document read off a wire, and the Python twin of Go's `seam.CanonicalFromJSON`, of Rust's
+    `serde_json::from_slice` + `canonical`, and of JavaScript's `canonicalFromJSON`.
+
+    WHY THIS EXISTS AT ALL, GIVEN `json.loads` ALREADY TAKES BYTES: because it takes them too
+    kindly. `json.loads(b)` runs `json.detect_encoding(b)` first, and that reader accepts a
+    document in UTF-8, UTF-16 or UTF-32, with or without a byte order mark. So
+    `b'\\xef\\xbb\\xbf{"a":1}'` is read as utf-8-sig, the mark is eaten, and `{"a":1}` comes
+    out — while Go's `encoding/json` and Rust's `serde_json::from_slice` both refuse that same
+    document at its first byte. One wire document, two verdicts, in a repository whose entire
+    job is that there is one.
+
+    AND THE ACCEPTING SIDE IS THE WORSE HALF. `\\xef\\xbb\\xbf{"a":1}` and `{"a":1}` are two
+    distinct byte strings that collapse to ONE canonical form, so a signature over the unmarked
+    document also authenticates the marked one at a stripping receiver, and the other way
+    about. That is the identical shape as the lone-surrogate collision closed in 0.3.0, with
+    the identical consequence: content its signer never saw, under a signature that verifies,
+    with nothing failing and nobody told. RFC 8259 §8.1 settles the direction — "Implementations
+    MUST NOT add a byte order mark to the beginning of a networked-transmitted JSON text" — and
+    this family has decided it once already: agent-entry's `conformance/receptor-check.mjs`
+    passes `ignoreBOM: true` to its strict decoder for exactly this reason, so that its
+    JavaScript and Python twins refuse together rather than splitting two-and-two.
+
+    The UTF-16/UTF-32 clause is the same guard's other half. It is NOT reachable through this
+    repository's own wire ingress — `protocol.loads`, `invite`, `jws` and `webbotauth` all
+    `.decode("utf-8")` explicitly first, and that raises — but it IS reachable through the path
+    the spec used to name, "`json.loads` then `crypto.canonical`", which is the path an
+    implementer copies. `detect_encoding` sniffs the first two bytes inside a four-byte window,
+    so refusing a NUL anywhere in that window covers every spelling of it, and no valid UTF-8
+    JSON document can begin with one.
+
+    `json.loads` still receives the BYTES afterwards, deliberately: that is the door that
+    refuses invalid UTF-8, while `canonical`'s `.encode("utf-8")` is the door that refuses a
+    lone surrogate (CPython decodes bytes with `surrogatepass`, so a CESU-8 spelling reaches
+    the encoder rather than the parser). One rule, two doors — and this puts a third in front
+    of both rather than moving either."""
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise TypeError("canonical_from_json takes the raw document BYTES, not a str")
+    raw = bytes(raw)
+    for bom in _JSON_BOMS:
+        if raw.startswith(bom):
+            raise ValueError(
+                f"json: document begins with a byte order mark ({bom.hex()}) — RFC 8259 §8.1 "
+                "forbids one, and stripping it makes two distinct documents sign one byte string")
+    if b"\x00" in raw[:4]:
+        raise ValueError(
+            "json: a NUL inside the first four bytes is how json.loads sniffs UTF-16/UTF-32 — "
+            "a JSON document on this wire is UTF-8, and no other encoding is read here")
+    return canonical(json.loads(raw))
+
+
 # RESERVED, NOT PRESENT: these six fields are protocol-fixed
 # (principle 4). Do NOT add replyTo (or any field) here to make reply attribution
 # tamper-proof — use a DETACHED replyToSig instead, owner-gated. Trigger + design:

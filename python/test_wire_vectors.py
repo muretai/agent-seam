@@ -241,6 +241,11 @@ def _binding_v2_cases() -> dict:
     owner_seed, device_seed = bytes([23] * 32), bytes([24] * 32)
     owner = crypto.did_from_public(crypto.ed25519_public_from_seed(owner_seed))
     device = crypto.did_from_public(crypto.ed25519_public_from_seed(device_seed))
+    #: A SECOND device DID, which signs nothing and appears in no binding. It exists to be the
+    #: `expectedDeviceDid` of `binding-lifted-to-another-device`: the anti-copy pin's only case,
+    #: and the reason its binding is GENUINE is that the attack is not a forgery — a real
+    #: binding, lifted onto another sender's message, is exactly what the pin is the belt over.
+    other_device = crypto.did_from_public(crypto.ed25519_public_from_seed(bytes([25] * 32)))
 
     def owner_sign(msg: bytes) -> str:
         return _b64(crypto.ed25519_sign(owner_seed, msg))
@@ -261,6 +266,15 @@ def _binding_v2_cases() -> dict:
             b, now=check_now, expected_device_did=device), f"control: {name}"
         cases.append({
             "name": name, "rootDid": owner, "deviceDid": device,
+            # WHAT THE RUNNER PASSES, carried per case rather than read off the binding — and
+            # that distinction is the whole of the 0.3.1 fix here. `expectedDeviceDid` is the
+            # CALLER's own idea of which device is sending, the same shape as `recipientDid` in
+            # `reject.message`; reading it off the binding made the anti-copy pin untestable,
+            # because `c.deviceDid ?? binding.deviceDid` is the binding's own value every time
+            # and `deviceDid !== expectedDeviceDid` was a branch no case could take. Same field
+            # and same value here as before; the difference is that it now has a source a case
+            # can change, and `bindingV2.reject/binding-lifted-to-another-device` changes it.
+            "expectedDeviceDid": device,
             "ownerSeed": owner_seed.hex(), "deviceSeed": device_seed.hex(),
             "ts": ts, "validUntil": valid_until,
             "bindingPayload": keybinding._binding_v2_payload(
@@ -271,11 +285,13 @@ def _binding_v2_cases() -> dict:
     valid = cases[0]["binding"]
     rejects = []
 
-    def add_reject(name: str, category: str, note: str, mutated: dict) -> None:
+    def add_reject(name: str, category: str, note: str, mutated: dict,
+                   expected_device_did: str = device) -> None:
         assert not keybinding.verify_device_binding_v2(
-            mutated, now=check_now, expected_device_did=device), \
+            mutated, now=check_now, expected_device_did=expected_device_did), \
             f"reject vector must actually reject: {name}"
         rejects.append({"name": name, "category": category, "mustReject": True,
+                        "expectedDeviceDid": expected_device_did,
                         "input": mutated, "note": note})
 
     # float ts — BOTH signatures re-made over the float bytes, so signature
@@ -319,6 +335,33 @@ def _binding_v2_cases() -> dict:
          "ts": 1784273681, "validUntil": 0,
          "sig": _b64(crypto.ed25519_sign(owner_seed, wrong_typ_payload)),
          "deviceSig": _b64(crypto.ed25519_sign(device_seed, wrong_typ_payload))})
+
+    # THE ANTI-COPY PIN — the belt over the piecewise checks, and the one guard in this group
+    # nothing tested. The binding is BYTE-IDENTICAL to `cases/no-expiry`: both signatures are
+    # genuine, `typ` is right, `ts` and `validUntil` are integers, it has not expired. Every
+    # other check in `verify_device_binding_v2` says yes. What is wrong is not in the record at
+    # all — it is who is presenting it. A binding is a public artifact; anyone who has seen one
+    # can attach it to their own message, and without the pin every receiver would read the
+    # thief's message as coming from the owner's account. So the caller states which device it
+    # believes it is talking to, and the binding must be about THAT device.
+    #
+    # This is the case the runners could not express until `expectedDeviceDid` came off the
+    # case instead of off the binding, and it is the only case in the file whose `input` is a
+    # perfectly valid record.
+    assert keybinding.verify_device_binding_v2(
+        valid, now=check_now, expected_device_did=device), \
+        "control: the lifted binding must be VALID for its own device, or this case is " \
+        "refused by some other check and pins nothing about the pin"
+    add_reject(
+        "binding-lifted-to-another-device", "wrong-device",
+        "a GENUINE, unmodified binding — the same bytes as cases/no-expiry, which the verifier "
+        "accepts — presented while the caller expects a DIFFERENT device. Nothing in the record "
+        "is wrong; the record is not ABOUT the sender. A binding is public, so anyone who has "
+        "seen one can lift it onto their own message and be read as the owner's account at "
+        "every receiver, and `expectedDeviceDid` is the only thing between that and a trusted "
+        "contact. Note where the expected value comes from: the CASE, never the binding — a "
+        "runner that reads it off the binding is asking the attacker who the attacker is.",
+        dict(valid), expected_device_did=other_device)
 
     return {"checkNow": check_now, "cases": cases, "reject": rejects}
 
@@ -1041,18 +1084,36 @@ def _reject_encoding_cases() -> dict:
     are ASCII documents; a raw invalid byte cannot be written any other way, which is why the
     carrier for the whole group is hex rather than a JSON string.
 
+    THE THIRD KIND, added in 0.3.1: the document's ENCODING, which is not a property of any
+    character in it. A leading UTF-8 byte order mark split this contract two-and-two — Python's
+    `json.loads` on bytes runs `detect_encoding` and reads it as utf-8-sig, JavaScript's
+    `TextDecoder('utf-8', {fatal:true})` STRIPS it because `ignoreBOM` defaults to false, while
+    Go and Rust both refuse at the first byte. And on the accepting side two distinct byte
+    strings, `EF BB BF {"a":1}` and `{"a":1}`, collapse to one canonical form: the same
+    collision as the lone surrogates above, so the same answer. RFC 8259 §8.1 says a networked
+    JSON text carries no mark, and agent-entry's `conformance/receptor-check.mjs` had already
+    decided this once for its own twins (`ignoreBOM: true`, so that both refuse). Python's
+    sniff additionally reads UTF-16 and UTF-32 documents nobody else will, which is the second
+    refusal here and the second clause of the same guard.
+
     `accept` is not decoration. A group that only ever refuses passes in an implementation that
     refuses everything, so a literal U+FFFD and a well-formed astral pair — one spelled as an
     escape pair, one as literal UTF-8 — are pinned here with the canonical bytes they must
-    produce. U+FFFD is a character like any other; it is the REPAIR that is forbidden, not the
-    code point."""
+    produce, and the marked document's UNMARKED twin is pinned beside it: the pair is the
+    collision written as arithmetic, and it is what says the refusal is about the mark and not
+    about `{"a":1}`. U+FFFD is a character like any other; it is the REPAIR that is forbidden,
+    not the code point."""
     def refuses(raw: bytes) -> bool:
-        """Does the real Python path refuse these bytes? json.loads decodes with the
-        `surrogatepass` error handler, so a CESU-8 spelling of a surrogate survives the parse
-        and is caught one step later by `canonical`'s `.encode("utf-8")` — two doors, one
-        refusal, and the case list below deliberately contains both kinds."""
+        """Does the real Python path refuse these bytes? THE PATH IS
+        `crypto.canonical_from_json`, which is what the spec names and what the checking half
+        of this file drives — an assertion here against some other spelling of the boundary
+        would be a generator vouching for a path nobody runs. Inside it: the encoding guard,
+        then `json.loads` on the bytes (which decodes with the `surrogatepass` error handler,
+        so a CESU-8 spelling of a surrogate survives the parse), then `canonical`'s
+        `.encode("utf-8")`. Three doors, one refusal, and the case list below deliberately
+        contains a document for each."""
         try:
-            crypto.canonical(json.loads(raw))
+            crypto.canonical_from_json(raw)
         except Exception:
             return True
         return False
@@ -1079,6 +1140,21 @@ def _reject_encoding_cases() -> dict:
          "Invalid UTF-8, and the case that proves the two refusals are one rule — Python's "
          "json.loads decodes it with `surrogatepass` and hands `canonical` a lone surrogate, "
          "so the document that entered as bad BYTES leaves through the surrogate door."),
+        ("leading-utf8-bom", b'\xef\xbb\xbf{"a":1}', "byte-order-mark",
+         "the ACCEPT case `same-document-unmarked` with EF BB BF in front of it. RFC 8259 §8.1 "
+         "says a networked JSON text does not carry a byte order mark, and the reason to refuse "
+         "rather than strip is in the pair: two distinct byte strings that both canonicalize to "
+         "{\"a\":1} are one signature authenticating a document its signer never saw, which is "
+         "the lone-surrogate collision above wearing a different hat. This one split the four "
+         "references two-and-two — Python read it as utf-8-sig, JavaScript's TextDecoder "
+         "stripped it (ignoreBOM defaults to FALSE, and the flag means `do not strip`), Go and "
+         "Rust refused at the first byte."),
+        ("utf16le-no-bom", '{"a":1}'.encode("utf-16-le"), "wrong-encoding",
+         "the same document as UTF-16LE with no mark at all. Python's json.loads sniffs the "
+         "encoding from NUL bytes in the first four and reads UTF-16 and UTF-32 documents the "
+         "other three refuse; nothing else on this wire has ever been anything but UTF-8. The "
+         "second clause of one guard, and its own case so that neither clause can be deleted "
+         "unnoticed."),
     ]
     refuse = []
     for name, raw, category, why in refuse_specs:
@@ -1097,23 +1173,44 @@ def _reject_encoding_cases() -> dict:
         ("astral-literal", '{"s":"\U0001F426"}'.encode("utf-8"),
          "the same character as raw UTF-8 bytes. Two spellings of one document: both must "
          "produce the identical canonical bytes as `astral-pair-escape` above."),
+        ("same-document-unmarked", b'{"a":1}',
+         "the OTHER HALF of `leading-utf8-bom`, and the reason that refusal is about the mark "
+         "rather than about this document. These two byte strings differ by three bytes and "
+         "canonicalize to one — so exactly one of them may be readable, and RFC 8259 §8.1 says "
+         "which. A reference that refused both would pass the refuse half and fail here."),
     ]
     accept = []
     for name, raw, why in accept_specs:
-        canon = crypto.canonical(json.loads(raw)).decode("utf-8")
+        canon = crypto.canonical_from_json(raw).decode("utf-8")
         accept.append({"name": name, "documentHex": raw.hex(), "canonical": canon, "why": why})
     assert accept[1]["canonical"] == accept[2]["canonical"], \
         "the escape and the literal spelling of one astral character are one document"
+    # THE COLLISION, ASSERTED AT GENERATION. The marked document and the unmarked one are two
+    # byte strings with one canonical form: that is the whole reason the mark is refused rather
+    # than stripped, and it is a property of these two vectors, so it is checked here rather
+    # than described.
+    _marked = next(c for c in refuse if c["name"] == "leading-utf8-bom")["documentHex"]
+    _unmarked = next(c for c in accept if c["name"] == "same-document-unmarked")
+    assert _marked != _unmarked["documentHex"] and _marked.endswith(_unmarked["documentHex"]), \
+        "the BOM case must be the unmarked case with a mark in front of it"
+    assert crypto.canonical(json.loads(bytes.fromhex(_marked))).decode("utf-8") \
+        == _unmarked["canonical"], \
+        "a STRIPPING reader turns the marked document into the accepted one — that collision " \
+        "is what the refusal exists to stop, and if it ever stops being true this case is moot"
 
     return {
         "note": "`documentHex` is the hex of the RAW DOCUMENT BYTES. Decode the hex, then parse, "
                 "then canonicalize: `refuse` must fail somewhere on that path and `accept` must "
                 "produce `canonical` exactly. Do not route this through a decoder that repairs — "
                 "Go's encoding/json and JavaScript's Buffer.toString('utf8') both substitute "
-                "U+FFFD and both then agree with a document nobody signed. The supported paths "
-                "are seam.Unmarshal / seam.CanonicalFromJSON (Go), a FATAL TextDecoder then "
-                "canonicalBytes (JavaScript), json.loads then crypto.canonical (Python), and "
-                "serde_json::from_slice then canonical (Rust).",
+                "U+FFFD and both then agree with a document nobody signed — and do not route it "
+                "through one that STRIPS or SNIFFS, which is the same defect one layer out: a "
+                "byte order mark removed, or a UTF-16 document decoded, is again two wire "
+                "documents signing one byte string. Each reference now owns the whole boundary "
+                "in one named function rather than asking its caller to assemble one: "
+                "seam.CanonicalFromJSON (Go), canonicalFromJSON (JavaScript), "
+                "crypto.canonical_from_json (Python), serde_json::from_slice then canonical "
+                "(Rust).",
         "accept": accept,
         "refuse": refuse,
     }
@@ -1205,6 +1302,30 @@ def _reject_keystate_cases() -> dict:
     e1_revoked_empty = record(1, op1, [])       # the honest empty list: burns nothing
     e1_revoked_self = record(1, op1, [op1])     # the honest full list: burns its own opDid
 
+    # THE VALIDITY WINDOW — `spec/seam.md` §6.1 rule 1, which was a rule nothing tested. Every
+    # one of the fifteen records above carries `notBefore: 0` and `notAfter: null`, so deleting
+    # the window check outright left BOTH references fully green: `checkNow` was carried,
+    # passed, and could not change an answer. These two records are the same honest delegation
+    # with a clock on it — one that has run out, one that has not started — and each must be
+    # ignored in favour of the root, which is the same verdict the resolver gives a record that
+    # does not verify at all, and for the same reason: an unusable KeyState delegates nothing.
+    e1_expired = ksmod.make_keystate(
+        root, epoch=1, op_did=op1, op_next_hash=ksmod.commit(op1), ts=check_now - 7200,
+        root_sign=sign, not_before=check_now - 7200, not_after=check_now - 3600)
+    e1_not_yet = ksmod.make_keystate(
+        root, epoch=1, op_did=op1, op_next_hash=ksmod.commit(op1), ts=check_now,
+        root_sign=sign, not_before=check_now + 3600, not_after=check_now + 7200)
+    # CONTROL, both halves. Each record is a GOOD record: it verifies inside its own window, so
+    # the signature, the rootKey and the epoch are all fine and the ONLY thing refusing it at
+    # `checkNow` is the clock. Without this half the two cases below would be indistinguishable
+    # from two records that were simply broken.
+    for _name, _rec, _inside in (("expired", e1_expired, check_now - 5400),
+                                 ("not-yet-valid", e1_not_yet, check_now + 5400)):
+        assert ksmod.verify_keystate(_rec, expected_root_did=root, now=_inside), \
+            f"control: {_name} must VERIFY inside its own window"
+        assert not ksmod.verify_keystate(_rec, expected_root_did=root, now=check_now), \
+            f"control: {_name} must be refused at checkNow, and only by the window"
+
     # CONTROL: every record here verifies on its own. No case in this group is about a bad
     # signature, and one that failed for one would be pinning nothing. For the four
     # wrong-typed records this control is the case's entire premise — if `verify_keystate`
@@ -1271,6 +1392,22 @@ def _reject_keystate_cases() -> dict:
                 "implementation that ignores `revokedOps` altogether: a genuine `[opDid]` list "
                 "really does burn, and a state that burns its OWN opDid authorizes nobody, so "
                 "the answer is the root DID."},
+        # ---- the validity window, at `checkNow`. §6.1 rule 1 stated it; nothing tested it.
+        {"name": "expired-window", "pinned": None, "inline": e1_expired,
+         "expect": root, "mustNotResolveTo": op1,
+         "why": "`notAfter` is an hour before checkNow. The record is otherwise perfect — it "
+                "verifies inside its own window — and an expired delegation authorizes nobody, "
+                "so the answer is the root DID. Until 0.3.1 every record in this group carried "
+                "`notBefore: 0` and `notAfter: null`, which meant deleting the window check "
+                "outright left both references green: `checkNow` was passed to a comparison "
+                "that no case could make come out differently."},
+        {"name": "not-yet-valid-window", "pinned": None, "inline": e1_not_yet,
+         "expect": root, "mustNotResolveTo": op1,
+         "why": "`notBefore` is an hour AFTER checkNow — the other end of the same window, and "
+                "its own case because `now > notAfter` and `now < notBefore` are two "
+                "comparisons and an implementation can carry one without the other. A "
+                "delegation that has not begun is not a delegation yet; pre-dating one is how "
+                "a key that will be published later is used today."},
     ]
     refuse = [
         {"name": "replayed-lower-epoch", "category": "keystate-rollback", "mustReject": True,
@@ -1408,6 +1545,170 @@ def _reject_claim_cases() -> list[dict]:
     return cases
 
 
+def _reject_cardpub_cases() -> list[dict]:
+    """Card envelopes a verifier MUST refuse — the half `cardpub` did not have until 0.3.1, and
+    the reason it had to.
+
+    THE SIGNED CARD IS THE ONLY PROOF THAT A DID BELONGS TO AN ORIGIN. A peer holding nothing
+    but a DID fetches `GET /card/<did>` from a relay it does not trust and verifies the envelope
+    locally; every consumer downstream treats a non-null return as identity PROVEN. And until
+    this group existed, nothing anywhere checked that the return was earned. `cardpub` carried
+    two positive cases and one anti-substitution case, and the anti-substitution case exercises
+    a string comparison (`expectedDid != card.did`) that runs perfectly well inside a verifier
+    which never looks at a signature at all. Measured before the change: `verifyCardEnvelope`
+    cut down to a shape check plus `return card` — no base64 decode, no length bound, no
+    payload, no crypto — kept `npm test` green at 17 + 105, and removing `verify_card_envelope`'s
+    verification kept the Python side green at 159. An implementation that returns the card for
+    ANY signature was CONFORMANT by this repository's own suite.
+
+    Three refusals, each built FROM the genuine envelope and mutated in exactly one dimension,
+    each pushed through the REAL verifier at build time:
+
+      * `sig-flipped-base64-char` — one character of the signature changed, in a data position
+        (never the trailing one, whose low bits no decoder reads — that is `reject.message`'s
+        `sig-not-canonical-base64`, a different rule). Still canonical base64, still 64 bytes,
+        so `b64_strict` passes it through and only the CRYPTO refuses. A verifier that decodes
+        the signature and never uses it passes every other case and fails this one.
+      * `signed-by-another-key` — the card is untouched, `card.did` is the honest DID, and the
+        envelope is signed by a key that is not it. This is the forgery the whole artifact
+        exists to prevent: a relay, or anyone who can answer for one, publishing a card under
+        somebody else's identity.
+      * `tampered-card-body` — a GENUINE signature over the original card, with the card's
+        `url` rewritten afterwards. The bytes on the wire are honestly signed bytes; they are
+        not signed bytes of THIS card. It is the case that catches a verifier which checks a
+        signature over something other than the exact canonical payload — re-serialising the
+        decoded card, say, or signing the envelope rather than `{card, ts, typ, v}`.
+
+    `expectedDid` sits at the TOP LEVEL of each case, as it does in `reject.message`: it is the
+    CALLER's own idea of whose card it asked for, and everything under `envelope` arrived on the
+    wire and is the attacker's to write."""
+    from shared import cardpub
+    seed = bytes([13] * 32)
+    other_seed = bytes([14] * 32)
+    did = crypto.did_from_public(crypto.ed25519_public_from_seed(seed))
+    card = {"did": did, "name": "Node", "url": "http://127.0.0.1:8001/"}
+    ts = 1784273681
+    payload = cardpub._envelope_payload(card, ts)
+
+    def envelope(c: dict, signature: str) -> dict:
+        return {"v": cardpub.CARD_ENVELOPE_VERSION, "typ": cardpub.CARD_ENVELOPE_TYPE,
+                "card": c, "ts": ts, "sig": signature}
+
+    genuine = envelope(card, _b64(crypto.ed25519_sign(seed, payload)))
+    # CONTROL: the envelope every case below is a mutation of must itself verify. A reject group
+    # built from a broken original refuses for the wrong reason, and every case reads green.
+    assert cardpub.verify_card_envelope(genuine, expected_did=did) is not None, \
+        "control: the unmutated card envelope must verify"
+
+    cases: list[dict] = []
+
+    def add(name: str, category: str, env: dict, why: str) -> None:
+        assert cardpub.verify_card_envelope(env, expected_did=did) is None, \
+            f"reject vector must actually be refused: {name}"
+        cases.append({"name": name, "category": category, "mustReject": True,
+                      "expectedDid": did, "envelope": env, "why": why})
+
+    # ONE CHARACTER of the signature, in the first data position. `b64_strict` must still ACCEPT
+    # the string — asserted, because if the strict reader refused it the case would be pinning
+    # base64 spelling (which `reject.message` already pins) instead of the signature check, and
+    # a verifier with no crypto in it would pass.
+    flipped_char = "B" if genuine["sig"][0] != "B" else "C"
+    flipped = flipped_char + genuine["sig"][1:]
+    assert crypto.b64_strict(flipped) is not None and len(crypto.b64_strict(flipped)) == 64, \
+        "the flipped signature must still be ONE canonical spelling of 64 bytes, or this case " \
+        "would be refused by the base64 reader and never reach the signature check"
+    add("sig-flipped-base64-char", "bad-signature", envelope(card, flipped),
+        "one character of the signature changed, in a data position — still canonical standard "
+        "base64, still exactly 64 bytes, so `b64_strict`/`strictB64` hands it straight to the "
+        "verifier. The ONLY thing that refuses it is the Ed25519 check, which is why a verifier "
+        "that decodes a signature and never uses it passes every other case in this file and "
+        "fails here.")
+
+    add("signed-by-another-key", "foreign-signer",
+        envelope(card, _b64(crypto.ed25519_sign(other_seed, payload))),
+        "the card is untouched and `card.did` is the honest DID; the signature is a real "
+        "signature by a DIFFERENT key over the identical payload. A signed card is the only "
+        "proof a DID belongs to an origin, and this is the forgery it exists to stop: a relay, "
+        "or anyone able to answer for one, publishing a card under somebody else's identity. "
+        "Verify under the DID the CARD names, never under whoever handed you the bytes.")
+
+    tampered = {**card, "url": "http://attacker.example/"}
+    assert crypto.canonical(tampered) != crypto.canonical(card), "the tamper must change bytes"
+    add("tampered-card-body", "tampered-payload",
+        envelope(tampered, genuine["sig"]),
+        "a GENUINE signature — it really was made by this DID — over the ORIGINAL card, with "
+        "`url` rewritten afterwards. The bytes are honestly signed bytes; they are not signed "
+        "bytes of this card. It catches a verifier that checks the signature against anything "
+        "other than the exact canonical payload of `{card, ts, typ, v}` — a re-serialised "
+        "decoded card, the envelope itself, or the card alone.")
+    return cases
+
+
+def _reject_did_cases() -> list[dict]:
+    """did:key strings a DECODER must refuse — `spec/seam.md` §2, which stated its rules and
+    pinned none of them until 0.3.1. The `did` group is ten positive round-trips, and a decoder
+    that returned `raw[2:]` for anything at all would pass every one.
+
+    Two rules, three cases, and the shape of each is chosen so that ONE missing check is enough
+    to fail it — a case that two independent checks both refuse tells you nothing about either.
+
+      * `x25519-multicodec` is the RIGHT LENGTH and the wrong prefix. 34 bytes, so a decoder
+        that only measures takes it and hands back 32 bytes of somebody's X25519 key as an
+        Ed25519 verification key.
+      * `ed25519-prefix-31-byte-key` and `ed25519-prefix-33-byte-key` are the RIGHT PREFIX and
+        the wrong length. A decoder that only checks the multicodec and slices `[2:]` returns 31
+        or 33 bytes, which a verifier then feeds to a library that answers false for a reason
+        nobody can read — or, worse, pads.
+
+    THE THIRD MUST — an over-long string — IS NOT PINNED HERE, AND CANNOT BE. It is stated in
+    §2 as a resource bound rather than a verdict, because no over-long base58 string can decode
+    to 34 bytes: a longer string is a larger integer, and leading `1`s only add leading zero
+    bytes. So the length rule above refuses every over-long DID in every implementation, with
+    or without a cap, and a vector for it would be green in an implementation that has no cap
+    at all — a check that cannot fail, which is the exact defect this release exists to close.
+    The cap is real and all four references now carry it (512 base58 characters); what it buys
+    is CPU, not a verdict, and cost is not something a byte vector can hold anyone to."""
+    ed_pub = bytes(range(32))
+    x25519_multicodec = b"\xec\x01"          # multicodec x25519-pub — 32-byte key, like ed25519
+    specs = [
+        ("x25519-multicodec", "wrong-multicodec",
+         x25519_multicodec + ed_pub,
+         "multicodec 0xec 0x01 (x25519-pub) and a 32-byte key: THIRTY-FOUR BYTES, exactly what "
+         "an ed25519 did:key decodes to. A decoder that checks only the length accepts it and "
+         "returns an X25519 key as a verification key. The prefix is the only thing that says "
+         "which curve, and `did:key` is a multi-curve method — this is a real identifier, for "
+         "something that is not an envelope signer."),
+        ("ed25519-prefix-31-byte-key", "wrong-length",
+         crypto._MULTICODEC_ED25519 + ed_pub[:31],
+         "the ed25519 multicodec and a THIRTY-ONE byte key. Right prefix, wrong length: a "
+         "decoder that checks the multicodec and slices [2:] returns 31 bytes and leaves the "
+         "next layer to notice, which is a rule stated in a place nobody reads it."),
+        ("ed25519-prefix-33-byte-key", "wrong-length",
+         crypto._MULTICODEC_ED25519 + ed_pub + b"\x00",
+         "the ed25519 multicodec and a THIRTY-THREE byte key — the same rule from the other "
+         "side, and the one a `>= 34` bound admits. A trailing zero byte is what an encoder "
+         "that padded to a block size would produce."),
+    ]
+    cases = []
+    for name, category, raw, why in specs:
+        did = "did:key:z" + crypto.b58encode(raw)
+        try:
+            crypto.public_from_did(did)
+            refused = False
+        except Exception:
+            refused = True
+        assert refused, f"did reject vector must actually be refused: {name}"
+        cases.append({"name": name, "category": category, "mustReject": True,
+                      "did": did, "decodedHex": raw.hex(), "why": why})
+    # CONTROL: every string here is a well-formed base58 did:key that DECODES — the refusal is
+    # the prefix or the length rule and nothing upstream of it. A case that failed in the base58
+    # alphabet check instead would pin nothing about either MUST.
+    for c, (_, _, raw, _) in zip(cases, specs):
+        assert crypto.b58decode(c["did"][len("did:key:z"):]) == raw, \
+            f"{c['name']}: the base58 must decode cleanly, or the refusal is not the codec rule"
+    return cases
+
+
 def build_vectors() -> dict:
     _invite_reject, _check_now = _reject_invite_cases()
     return {
@@ -1517,6 +1818,14 @@ def build_vectors() -> dict:
         # fail-open client (how the Swift client shipped accepting forged senders, audit 2026-07-17).
         "reject": {
             "message": _reject_message_cases(),
+            # did:key strings a DECODER must refuse. §2 stated three MUSTs and pinned none of
+            # them: the `did` group is ten positive round-trips, which a decoder that returned
+            # `raw[2:]` for anything at all would pass in full.
+            "did": _reject_did_cases(),
+            # Card envelopes a verifier must refuse. `cardpub` had two positive cases and no
+            # negative half, so a verifier that returned the card for ANY signature was
+            # conformant — and the signed card is the only proof a DID belongs to an origin.
+            "cardpub": _reject_cardpub_cases(),
             # The bytes-in half. Everything else under `reject` is a decoded VALUE; this one is
             # raw document bytes, because the defect it pins (a repaired lone surrogate, a
             # repaired invalid byte) has already been erased by the time a value exists.
@@ -1529,7 +1838,18 @@ def build_vectors() -> dict:
         },
         "rejectNote": "Each case MUST be rejected by your receiver (`mustReject`). `category` is "
                       "language-neutral guidance, NOT core's -32xxx — your own error taxonomy is "
-                      "yours. message: verified with the key DERIVED FROM `from` "
+                      "yours. did: the did:key CODEC (publicKeyHexFromDid / public_from_did / "
+                      "PublicKeyFromDID / public_key_from_did) — the multicodec and the exact "
+                      "34 decoded bytes, each case shaped so ONE missing check fails it; there "
+                      "is deliberately NO over-long case, because no over-long base58 decodes to "
+                      "34 bytes and such a vector would be green in an implementation with no "
+                      "length cap at all (the cap is real, it is 512 in all four references, and "
+                      "it buys CPU rather than a verdict — spec §2). cardpub: the card envelope "
+                      "verifier, with `expectedDid` at the TOP LEVEL of the case because it is "
+                      "the CALLER's idea of whose card was asked for; a verifier that returns "
+                      "the card without checking the signature passes every positive case in "
+                      "this file and fails all three of these. message: verified with the key "
+                      "DERIVED FROM `from` "
                       "(crypto.verify_envelope) — and note that `wire-names-its-own-recipient` "
                       "carries `verifierNamesNoRecipient`, which means the verifier must be called "
                       "with NO recipient of its own; naming one makes the case pass for the wrong "
@@ -1730,6 +2050,46 @@ def test_invite_vectors_verify() -> None:
            f"invite signing payload is byte-stable: {c['name']}")
 
 
+def test_binding_v2_vectors_through_the_real_verifier() -> None:
+    """The countersigned account binding, driven from the FILE through
+    `keybinding.verify_device_binding_v2` — the function a receiver actually runs.
+
+    It was driven only from the GENERATOR before 0.3.1, which is a weaker claim than it looks:
+    the generator's asserts read local variables, so they say "what I just minted verifies",
+    never "what is pinned on disk verifies". More to the point, every one of them passed
+    `expected_device_did=device` — the device the binding itself names — so the anti-copy pin,
+    documented as "the belt over the piecewise checks", was exercised only ever with the answer
+    it wanted. `bindingV2.reject/binding-lifted-to-another-device` is the case that makes it
+    bite, and `expectedDeviceDid` comes off the CASE so that it can.
+    """
+    print("\n[11b] the pinned device bindings pass keybinding's own verifier, pin included")
+    v = json.loads(VECTORS.read_text())["bindingV2"]
+    now = v["checkNow"]
+    for c in v["cases"]:
+        ok(keybinding.verify_device_binding_v2(
+            c["binding"], now=now, expected_device_did=c["expectedDeviceDid"]) is True,
+           f"a pinned binding verifies for its own device: {c['name']}")
+    for r in v["reject"]:
+        # `expectedDeviceDid` from the CASE and nowhere else. Falling back to the binding's own
+        # `deviceDid` is what made this untestable: the expected value would then be the
+        # attacker's value, and `deviceDid != expected` a branch nothing could take.
+        ok(keybinding.verify_device_binding_v2(
+            r["input"], now=now, expected_device_did=r["expectedDeviceDid"]) is False,
+           f"binding reject [{r['category']}]: {r['name']}")
+    # THE PAIR THAT MAKES THE PIN MEAN SOMETHING. The lifted case's bytes are the accepted
+    # case's bytes; only the caller's expectation differs. Asserting the refusal alone would be
+    # satisfied by a verifier that refuses that record for some other reason, and asserting the
+    # acceptance alone is what the file did before.
+    lifted = next(r for r in v["reject"] if r["name"] == "binding-lifted-to-another-device")
+    own = next(c for c in v["cases"] if c["name"] == "no-expiry")
+    ok(lifted["input"] == own["binding"]
+       and lifted["expectedDeviceDid"] != own["expectedDeviceDid"]
+       and keybinding.verify_device_binding_v2(
+           lifted["input"], now=now, expected_device_did=own["expectedDeviceDid"]) is True,
+       "the lifted binding is BYTE-IDENTICAL to the accepted one and differs only in who the "
+       "caller expected — so the refusal is the anti-copy pin and nothing else")
+
+
 def test_cardpub_vectors_verify_through_the_real_verifier() -> None:
     """Each pinned card envelope must be accepted by `cardpub.verify_card_envelope` itself — the
     function a peer actually runs when it fetches a card by DID. Asserting the payload string
@@ -1761,6 +2121,32 @@ def test_cardpub_vectors_verify_through_the_real_verifier() -> None:
         _env = cardpub.make_card_envelope(_id, _card, _ts)
         ok(cardpub.verify_card_envelope(_env, expected_did=_id.did) is not None,
            f"this verifier accepts a {_label} card envelope")
+
+    # ---- THE NEGATIVE HALF, and the reason the positive one above proves less than it looks.
+    #
+    # Everything before this line is satisfied by a verifier that never checks a signature.
+    # Measured: `verify_card_envelope` with its `crypto.verify` call removed — shape check, then
+    # `return card` — kept this file green at 159, and the JavaScript twin cut down the same way
+    # kept `npm test` green at 17 + 105. The anti-substitution case does not save it either:
+    # `expected_did != card["did"]` is a string comparison that runs perfectly well inside a
+    # verifier with no crypto in it at all. So an implementation of the card envelope that
+    # returns the card for ANY signature was CONFORMANT by this repository's own suite — and the
+    # signed card is the only proof a DID belongs to an origin.
+    rej = json.loads(VECTORS.read_text())["reject"]["cardpub"]
+    for c in rej:
+        ok(cardpub.verify_card_envelope(c["envelope"], expected_did=c["expectedDid"]) is None,
+           f"card envelope reject [{c['category']}]: {c['name']}")
+    # META-CONTROL, the twin of the one `reject.message` has carried since the RelayKit audit.
+    # A fail-open verifier — one that returns the card whatever it was handed — must be REJECTED
+    # BY THIS SUITE, not passed by it. The message envelope has had this assertion for a year
+    # and the card envelope had none, which is exactly how the group came to have no negative
+    # half at all: nothing was watching the watcher.
+    fail_open = lambda env, expected_did=None: (env or {}).get("card")   # noqa: E731
+    missed = [c["name"] for c in rej
+              if fail_open(c["envelope"], expected_did=c["expectedDid"]) is not None]
+    ok(len(missed) == len(rej) and len(rej) > 0,
+       f"a fail-open card verifier is caught by all {len(rej)} of these cases — so this suite "
+       "FAILS such an implementation instead of certifying it")
 
 
 def _reencode_jws_payload(token: str, mutate: Callable[[dict], None]) -> str:
@@ -2059,23 +2445,51 @@ def test_reject_vectors_are_rejected() -> None:
         else:
             ok(_verifier_rejects_message(c["input"]), f"message reject [{c['category']}]: {c['name']}")
 
+    # ---- the did:key decoder, through the real codec.
+    #
+    # `crypto.public_from_did` is the ed25519 codec every verify path opens with, and it is the
+    # one the other three references spell as `publicKeyHexFromDid` / `PublicKeyFromDID` /
+    # `public_key_from_did`. The `did` group above is ten positive round-trips; a decoder that
+    # returned `raw[2:]` for anything would pass all ten, so §2's two verdict rules — the
+    # multicodec and the length — are pinned here from the side that can fail.
+    for c in rej["did"]:
+        try:
+            crypto.public_from_did(c["did"])
+            refused = False
+        except Exception:
+            refused = True
+        ok(refused, f"did reject [{c['category']}]: {c['name']}")
+    # The control that says the refusals above are the CODEC's rules and not the alphabet's.
+    # Every string in the group is well-formed base58 that decodes cleanly; if one of them
+    # failed at `b58decode` instead, it would pin nothing about either MUST.
+    ok(all(crypto.b58decode(c["did"][len("did:key:z"):]).hex() == c["decodedHex"]
+           for c in rej["did"]),
+       f"all {len(rej['did'])} refused DIDs are well-formed base58 that decodes — the refusal "
+       "is the multicodec or the length, never a malformed string")
+
     # ---- the encoding group: raw document BYTES, through the real parse-and-canonicalize path.
     #
-    # `json.loads` is handed the bytes rather than a str on purpose: that is the boundary where
-    # Python refuses an invalid UTF-8 document, exactly as `seam.Unmarshal` does in Go and
-    # `serde_json::from_slice` does in Rust. The surrogate escapes get past it (CPython decodes
-    # bytes with the `surrogatepass` handler) and are caught one step later by `canonical`'s
-    # `.encode("utf-8")`. Two doors, and a case for each kind, so neither can be removed unnoticed.
+    # `crypto.canonical_from_json` is that path — one named function, the same shape as Go's
+    # `seam.CanonicalFromJSON`, and what `spec/seam.md` §1.1 names. It was a two-step recipe
+    # here until 0.3.1 (`json.loads` on the bytes, then `crypto.canonical`), and a recipe is not
+    # a guard: `json.loads` on BYTES sniffs the encoding, so it read a byte-order-marked
+    # document as utf-8-sig and a UTF-16 document as UTF-16, and the runner that drove the
+    # recipe could not have noticed because the recipe was the thing being tested.
+    #
+    # Three doors behind it, and a case for each kind so that none can be removed unnoticed:
+    # the encoding guard (byte-order-mark, wrong-encoding), `json.loads` on the bytes
+    # (invalid-utf8 — the surrogate ESCAPES get past it, CPython decoding bytes with the
+    # `surrogatepass` handler), and `canonical`'s `.encode("utf-8")` (lone-surrogate).
     enc = rej["encoding"]
     for c in enc["accept"]:
         raw = bytes.fromhex(c["documentHex"])
-        got = crypto.canonical(json.loads(raw))
+        got = crypto.canonical_from_json(raw)
         ok(got == c["canonical"].encode("utf-8"),
            f"encoding accept: {c['name']} — canonicalizes to the pinned bytes")
     for c in enc["refuse"]:
         raw = bytes.fromhex(c["documentHex"])
         try:
-            crypto.canonical(json.loads(raw))
+            crypto.canonical_from_json(raw)
             refused = False
         except Exception:
             refused = True
@@ -2086,6 +2500,12 @@ def test_reject_vectors_are_rejected() -> None:
     # is the vulnerability stated as arithmetic rather than as prose. A signature over the honest
     # `literal-replacement-char` document also authenticates, at such a receiver, documents its
     # signer never saw.
+    #
+    # Scoped to the two CHARACTER categories on purpose. `byte-order-mark` and `wrong-encoding`
+    # are the same vulnerability one layer out — a mark stripped, an encoding sniffed — but a
+    # repairing reader is not what commits it and `_repaired` cannot even run on them (a
+    # stripped BOM is a document json.loads reads, a UTF-16 document is not). Their own
+    # collision is asserted in the generator, against the `same-document-unmarked` twin.
     def _repaired(doc: bytes) -> bytes:
         def fix(s: str) -> str:
             return "".join(_FFFD if 0xd800 <= ord(ch) <= 0xdfff else ch for ch in s)
@@ -2095,12 +2515,27 @@ def test_reject_vectors_are_rejected() -> None:
 
     honest_fffd = next(c["canonical"].encode("utf-8") for c in enc["accept"]
                        if c["name"] == "literal-replacement-char")
-    repaired = [_repaired(bytes.fromhex(c["documentHex"])) for c in enc["refuse"]]
+    by_character = [c for c in enc["refuse"]
+                    if c["category"] in ("lone-surrogate", "invalid-utf8")]
+    repaired = [_repaired(bytes.fromhex(c["documentHex"])) for c in by_character]
     ok(repaired.count(honest_fffd) >= 2 and len(set(repaired)) < len(repaired),
-       f"a repairing reader turns {repaired.count(honest_fffd)} of the {len(enc['refuse'])} "
-       f"refused documents into `literal-replacement-char` — the ACCEPTED one — and collapses "
-       f"all {len(enc['refuse'])} to {len(set(repaired))} distinct byte strings. That collision "
-       "is what this group refuses: one signature would authenticate documents its signer never saw")
+       f"a repairing reader turns {repaired.count(honest_fffd)} of the {len(by_character)} "
+       f"character-level refused documents into `literal-replacement-char` — the ACCEPTED one — "
+       f"and collapses all {len(by_character)} to {len(set(repaired))} distinct byte strings. "
+       "That collision is what this group refuses: one signature would authenticate documents "
+       "its signer never saw")
+    # The ENCODING half of the same arithmetic. A stripping reader turns the marked document
+    # into the accepted unmarked one — two wire documents, one signature — which is why the mark
+    # is refused rather than removed. Asserted here and not merely described, because "these two
+    # collide" is the entire argument for the refusal.
+    _bom = next(c for c in enc["refuse"] if c["name"] == "leading-utf8-bom")
+    _bare = next(c for c in enc["accept"] if c["name"] == "same-document-unmarked")
+    _stripped = crypto.canonical(json.loads(bytes.fromhex(_bom["documentHex"])))
+    ok(_bom["documentHex"] != _bare["documentHex"]
+       and _stripped == _bare["canonical"].encode("utf-8"),
+       f"a STRIPPING reader turns `{_bom['name']}` into `{_bare['name']}` — two distinct wire "
+       f"documents, {_stripped.decode()} either way — so exactly one of the pair may be read, "
+       "and RFC 8259 §8.1 says which")
 
     # ---- the keystate ratchet, through the real resolver.
     #
@@ -2206,6 +2641,7 @@ def main() -> int:
     test_ownerstate_vectors_verify()
     test_cryptobox_vectors_actually_open()
     test_invite_vectors_verify()
+    test_binding_v2_vectors_through_the_real_verifier()
     test_cardpub_vectors_verify_through_the_real_verifier()
     test_domain_linkage_vectors_verify_through_the_real_verifier()
     test_webbotauth_vectors_are_rederived_by_the_real_module()

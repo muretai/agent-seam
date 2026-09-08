@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-  canonicalJSON, canonicalBytes, didFromPublicKeyHex, publicKeyHexFromDid, publicKeyFromSeedHex,
+  canonicalJSON, canonicalFromJSON, didFromPublicKeyHex, publicKeyHexFromDid, publicKeyFromSeedHex,
   signingPayload, signEnvelope, verifyEnvelope, cardEnvelopePayload, verifyCardEnvelope,
   encPubHex, openBox, verifyDeviceBindingV2, wbaVerifyRequest, resolveOpDid,
 } from '../seam.mjs';
@@ -66,6 +66,17 @@ for (const v of vectors.did) {
   check(got === v.did, `did/encode/${v.publicHex.slice(0, 12)}…`, got === v.did ? '' : `want ${v.did}\n      got  ${got}`);
   const back = attempt(() => publicKeyHexFromDid(v.did));
   check(back === v.publicHex, `did/decode/${v.did.slice(8, 20)}…`, back === v.publicHex ? '' : `want ${v.publicHex}\n      got  ${back}`);
+}
+// The other direction of the same door. `did` above is ten positive round-trips, and a decoder
+// that answered `raw.subarray(2)` for anything at all would pass every one of them — so
+// `spec/seam.md` §2's two verdict rules, the multicodec and the length, are pinned from the side
+// that can fail. `x25519-multicodec` is the sharp one: 34 bytes, exactly what an ed25519 did:key
+// decodes to, so only the PREFIX check refuses it and a decoder that measures alone hands back
+// somebody's X25519 key as a verification key.
+for (const c of vectors.reject.did) {
+  let refused;
+  try { publicKeyHexFromDid(c.did); refused = false; } catch { refused = true; }
+  check(refused, `did/reject/${c.name}`, `DECODED a did:key it must refuse — ${c.why || ''}`);
 }
 
 // ---------------------------------------------------------------- the six signed fields
@@ -122,30 +133,35 @@ for (const v of vectors.reject.message) {
 // byte are both U+FFFD by then, and U+FFFD is a character this reference encodes happily. The
 // evidence is gone one line before the bytes get signed.
 //
-// THE DECODE MUST BE FATAL, and that is the trap. `buf.toString('utf8')` REPAIRS — measured on
-// this build: `truncated-utf8-sequence`, `stray-continuation-byte` and `surrogate-encoded-as-
-// utf8` all come back as ordinary strings and canonicalize without complaint, two of them
-// straight into the canonical bytes of `literal-replacement-char`, which is a document in the
-// ACCEPT half. A runner that decoded that way would print three green checks for three
-// documents this reference had just silently rewritten. So the boundary is a fatal
-// TextDecoder, which is what the seam asks of any JavaScript caller reading bytes off a wire.
+// THE PATH IS `canonicalFromJSON`, one named function of the library, and that it is not three
+// lines of this runner is the fix 0.3.1 made. This loop used to assemble its own boundary —
+// `new TextDecoder('utf-8', { fatal: true })`, then `JSON.parse`, then `canonicalBytes` — which
+// held the reference to a RECIPE rather than to the seam, and the recipe was wrong in a way the
+// runner could not see. `ignoreBOM` defaults to FALSE, and the flag means "do not STRIP", so
+// that decoder silently removed a leading U+FEFF: `EF BB BF {"a":1}` parsed cleanly here while
+// Go and Rust refused it at the first byte, and on this side two distinct byte strings
+// collapsed to one canonical form. A runner must exercise the path a user is told to take, and
+// there was no such path — only an instruction to build one.
 //
-// `canonicalBytes`, not `canonicalJSON`: `assertEncodable` lives in the former, and it is what
-// refuses the surrogate ESCAPES — legal JSON text, illegal strings, which the fatal decoder
-// cannot see because the document is pure ASCII. Two doors in JavaScript where Go has one, and
-// both are required.
+// Three doors behind that one call, and the group carries a case for each. The BOM/encoding
+// guard. The FATAL decode: `buf.toString('utf8')` REPAIRS — measured on this build,
+// `truncated-utf8-sequence`, `stray-continuation-byte` and `surrogate-encoded-as-utf8` all come
+// back as ordinary strings and canonicalize without complaint, two of them straight into the
+// canonical bytes of `literal-replacement-char`, which is a document in the ACCEPT half. And
+// `assertEncodable` inside `canonicalBytes`, which is what refuses the surrogate ESCAPES —
+// legal JSON text, illegal strings, invisible to any decoder because the document is pure
+// ASCII.
 {
-  const fatal = new TextDecoder('utf-8', { fatal: true });
-  const parse = (hex) => JSON.parse(fatal.decode(Buffer.from(hex, 'hex')));
   const enc = vectors.reject.encoding;
+  const bytes = (hex) => Buffer.from(hex, 'hex');
   for (const c of enc.accept) {
-    const got = attempt(() => canonicalBytes(parse(c.documentHex)).toString('utf8'));
+    const got = attempt(() => canonicalFromJSON(bytes(c.documentHex)).toString('utf8'));
     check(got === c.canonical, `encoding/accept/${c.name}`,
           got === c.canonical ? '' : `want ${JSON.stringify(c.canonical)}\n      got  ${JSON.stringify(got)}`);
   }
   for (const c of enc.refuse) {
     let refused;
-    try { canonicalBytes(parse(c.documentHex)); refused = false; } catch { refused = true; }
+    try { canonicalFromJSON(bytes(c.documentHex)); refused = false; } catch { refused = true; }
     check(refused, `encoding/refuse/${c.name}`, `ACCEPTED bytes it must refuse — ${c.why || ''}`);
   }
 }
@@ -203,6 +219,25 @@ for (const c of vectors.cardpub) {
   const wrong = attempt(() => verifyCardEnvelope(env, 'did:key:zSomeoneElse'));
   check(wrong === null || wrong === false, 'cardpub/wrong-did-refused', `got ${JSON.stringify(wrong).slice(0, 80)}`);
 }
+// THE NEGATIVE HALF, and the reason everything above it proved less than it looked. Those checks
+// assert only that `verifyCardEnvelope` returned something non-null, and `cardpub/wrong-did-
+// refused` exercises the `expectedDid !== card.did` STRING COMPARISON — which runs perfectly
+// well inside a verifier that never looks at a signature. Measured before 0.3.1:
+// `verifyCardEnvelope` cut down to a shape check plus `return card` — no base64 decode, no
+// length bound, no payload, no crypto — kept this runner green at 105 and `npm test` green at
+// 17 + 105. An implementation of the card envelope that returns the card for ANY signature was
+// CONFORMANT by this repository's own suite, and the signed card is the only proof that a DID
+// belongs to an origin: every consumer treats a non-null return as identity proven.
+//
+// `expectedDid` comes off the TOP LEVEL of the case — the caller's own idea of whose card it
+// asked for — and never out of `envelope`, which arrived on the wire. Same rule as
+// `recipientDid` in `reject.message`, and for the same reason.
+for (const c of vectors.reject.cardpub) {
+  const got = attempt(() => verifyCardEnvelope(c.envelope, c.expectedDid));
+  const refused = got === null || got === false || String(got).startsWith('THREW');
+  check(refused, `cardpub/reject/${c.name}`,
+        `ACCEPTED a card envelope it must refuse — ${c.why || ''}\n      got ${JSON.stringify(got).slice(0, 80)}`);
+}
 
 // ---------------------------------------------------------------- cryptobox: open what core sealed
 {
@@ -230,19 +265,50 @@ for (const c of vectors.cardpub) {
 }
 
 // ---------------------------------------------------------------- device-key binding v2
+//
+// `expectedDeviceDid` COMES OFF THE CASE AND NOWHERE ELSE. It is the CALLER's own idea of which
+// device is sending — the same distinction the reject loop one screen above draws for
+// `recipientDid`, and the same defect, still live here until 0.3.1: this loop read
+// `c.deviceDid ?? binding.deviceDid ?? null`, and every case's top-level `deviceDid` EQUALS the
+// binding's own, so the expected value was the binding's value every time and
+// `deviceDid !== expectedDeviceDid` was a branch no case could take. The anti-copy pin — "a
+// binding lifted onto another sender's message fails", the belt over the piecewise checks — had
+// no test at all, in either reference.
+//
+// A fallback to the binding is not a convenience, it is the bug: it asks the attacker who the
+// attacker is. So there is none, in either loop. A case that carries no `expectedDeviceDid`
+// gets `null`, which is "the caller names nobody" — a real mode of the API, and visibly not the
+// pin being exercised.
 {
   const b = vectors.bindingV2;
   for (const c of b.cases) {
     const binding = c.binding ?? c.input ?? c;
-    const ok = attempt(() => verifyDeviceBindingV2(binding, { now: b.checkNow, expectedDeviceDid: c.deviceDid ?? binding.deviceDid ?? null }));
+    const ok = attempt(() => verifyDeviceBindingV2(binding,
+      { now: b.checkNow, expectedDeviceDid: c.expectedDeviceDid ?? null }));
     check(ok === true, `bindingV2/accept/${c.name}`, `got ${JSON.stringify(ok).slice(0, 80)}`);
   }
   for (const r of b.reject) {
     const binding = r.binding ?? r.input ?? r;
     let ok;
-    try { ok = verifyDeviceBindingV2(binding, { now: b.checkNow }); } catch { ok = false; }
-    check(ok === false, `bindingV2/reject/${r.name}`, `ACCEPTED a binding it must refuse — ${r.why || ''}`);
+    try {
+      ok = verifyDeviceBindingV2(binding, { now: b.checkNow, expectedDeviceDid: r.expectedDeviceDid ?? null });
+    } catch { ok = false; }
+    check(ok === false, `bindingV2/reject/${r.name}`, `ACCEPTED a binding it must refuse — ${r.note || r.why || ''}`);
   }
+  // THE PAIR. `binding-lifted-to-another-device` carries the accepted case's BYTES; only the
+  // caller's expectation differs. Asserting the refusal alone would be met by a verifier that
+  // refuses that record for some other reason, so the identity of the two records is asserted
+  // here rather than trusted from the generator.
+  const lifted = b.reject.find((r) => r.name === 'binding-lifted-to-another-device');
+  const own = b.cases.find((c) => c.name === 'no-expiry');
+  check(!!lifted && !!own
+        && JSON.stringify(lifted.input) === JSON.stringify(own.binding)
+        && lifted.expectedDeviceDid !== own.expectedDeviceDid
+        && attempt(() => verifyDeviceBindingV2(lifted.input,
+             { now: b.checkNow, expectedDeviceDid: own.expectedDeviceDid })) === true,
+        'bindingV2/anti-copy-pin-is-the-only-difference',
+        'the lifted binding must be byte-identical to the accepted one and differ only in who '
+        + 'the caller expected — otherwise its refusal pins something other than the pin');
 }
 
 // ---------------------------------------------------------------- Web Bot Auth (RFC 9421 subset), verify-only

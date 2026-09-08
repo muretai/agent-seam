@@ -38,7 +38,16 @@ USAGE (each handler keeps its own error-response style):
     raw = httputil.read_body(self)
     if raw is httputil.BODY_TOO_LARGE:
         self._send(413, ...); return
-    body = json.loads(raw) if raw else {}
+    body = protocol.loads_object(raw) if raw else {}
+
+  `protocol.loads_object`, and NOT `json.loads(raw)`, which is what this line said until
+  0.3.1. `read_body` returns BYTES, and `json.loads` on bytes runs `json.detect_encoding`
+  first: it eats a leading UTF-8 byte order mark and reads UTF-16 and UTF-32 documents,
+  neither of which the Go, Rust or JavaScript references will read. A recipe in a docstring
+  is a recipe someone follows. `protocol.loads` decodes UTF-8 explicitly and raises on
+  anything else, and `loads_object` adds the top-level-object contract every JSON-RPC entry
+  point already assumes. For a document whose CANONICAL BYTES you then need, the whole
+  boundary is `crypto.canonical_from_json(raw)`.
 """
 # SPDX-License-Identifier: MIT
 # Part of the SEAM: the bytes every implementation of this protocol must reproduce --

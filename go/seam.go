@@ -368,7 +368,27 @@ func b58Encode(data []byte) string {
 	return string(out)
 }
 
+// MaxBase58Len bounds what b58Decode will even look at. Every legitimate base58 here is far
+// under it — a did:key is about 48 characters — and it changes NO VERDICT: the loop below is
+// quadratic in the input length, and a string long enough to be slow decodes to far more than
+// the 34 bytes PublicKeyFromDID demands, so an over-long DID was already refused. What it buys
+// is CPU, and the cost is not theoretical. `Envelope.VerifySignature` calls PublicKeyFromDID on
+// `e.From`, which is attacker-written and bounded only by the body limit, BEFORE any signature
+// is checked: measured on this build, a 256 KB `from` costs 1.19 s of CPU per request and a
+// 1 MiB one — inside shared/httputil's own MAX_BODY_BYTES — costs 13.9 s. That is
+// unauthenticated CPU exhaustion at the one door every message goes through.
+//
+// 512, the same constant as shared/crypto._MAX_B58_LEN and js/seam.mjs MAX_B58_LEN, so all four
+// references now refuse the same strings for the same reason at the same size. (Reported to us
+// as "2.0 seconds on a 400-character DID"; measured here, 400 characters costs 13 microseconds
+// in Go and 869 in Rust. The defect is real and the number was not — the quadratic only bites
+// five orders of magnitude further out, which is still well inside one request body.)
+const MaxBase58Len = 512
+
 func b58Decode(s string) ([]byte, error) {
+	if len(s) > MaxBase58Len {
+		return nil, fmt.Errorf("base58: input is %d characters, over the %d-character bound", len(s), MaxBase58Len)
+	}
 	n := new(big.Int)
 	radix := big.NewInt(58)
 	for _, c := range []byte(s) {

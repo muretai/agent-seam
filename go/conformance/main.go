@@ -178,6 +178,33 @@ func main() {
 
 	// ---- the refusals
 	rejects, _ := v["reject"].(map[string]any)
+
+	// reject.did — the other direction of the codec above.
+	//
+	// `did` is ten positive round-trips, and a decoder that answered `raw[2:]` for anything at
+	// all would pass every one of them, so spec §2's two verdict rules are pinned here from the
+	// side that can fail. `x25519-multicodec` is the sharp one: THIRTY-FOUR BYTES, exactly what
+	// an ed25519 did:key decodes to, so only the PREFIX check refuses it and a decoder that
+	// measures alone hands back somebody's X25519 key as a verification key.
+	//
+	// The group carries no over-long case, and that is deliberate: no over-long base58 string
+	// can decode to 34 bytes (a longer string is a larger integer, and leading '1's only add
+	// leading zero bytes), so the length rule refuses every one of them with or without a cap.
+	// Such a vector would be green in an implementation that has no cap at all — a check that
+	// cannot fail. The cap is in seam.go as MaxBase58Len regardless, because it buys CPU.
+	didRejects, _ := rejects["did"].([]any)
+	check(len(didRejects) > 0, "did/reject/group-present",
+		"reject.did is missing or empty — this runner loops over it and cannot loop over nothing")
+	for _, c := range didRejects {
+		m := c.(map[string]any)
+		if _, err := seam.PublicKeyFromDID(str(m, "did")); err == nil {
+			check(false, "did/reject/"+str(m, "name"),
+				"DECODED a did:key it must refuse — "+str(m, "why"))
+		} else {
+			check(true, "did/reject/"+str(m, "name"), "")
+		}
+	}
+
 	msgs, _ := rejects["message"].([]any)
 	for _, c := range msgs {
 		m := c.(map[string]any)
@@ -279,6 +306,18 @@ func main() {
 		"reject.keystate is missing or empty — this runner skips the group ON PURPOSE and "+
 			"cannot skip a group that is not there")
 
+	// ---- reject.cardpub: SKIPPED HERE TOO, AND SAID SO, for the same reason and by the same
+	// discipline. There is no card envelope in seam.go — the README's coverage table has marked
+	// `cardpub` as "—" for Go since this reference was written — so there is nothing here to
+	// hold to it. The group is new in 0.3.1 and is the one that closes the largest hole in this
+	// repository, so it is worth stating plainly that Go is not one of the implementations
+	// closing it: an omission nobody can see is the same as a check nobody has.
+	cardRejects, _ := rejects["cardpub"].([]any)
+	cardSkipped := len(cardRejects)
+	check(cardSkipped > 0, "cardpub/skipped-deliberately",
+		"reject.cardpub is missing or empty — this runner skips the group ON PURPOSE and "+
+			"cannot skip a group that is not there")
+
 	if len(failures) > 0 {
 		fmt.Printf("\nFAILED — %d of %d checks:\n\n", len(failures), pass+len(failures))
 		for _, f := range failures {
@@ -291,6 +330,7 @@ func main() {
 	fmt.Printf("OK — %d checks: the bytes match, every value no two languages spell alike was refused,\n", pass)
 	fmt.Printf("     and every message that must be refused was.\n     (%d ed25519 did cases; vectors: %s)\n", ed, path)
 	fmt.Printf("     SKIPPED ON PURPOSE: reject.keystate, %d cases — this reference implements no\n", skipped)
-	fmt.Printf("     KeyState, so it has no resolver to hold to the ratchet. Said out loud because a\n")
-	fmt.Printf("     group nobody loops over looks exactly like a group that passes.\n")
+	fmt.Printf("     KeyState, so it has no resolver to hold to the ratchet; and reject.cardpub,\n")
+	fmt.Printf("     %d cases — no card envelope here either. Said out loud because a group nobody\n", cardSkipped)
+	fmt.Printf("     loops over looks exactly like a group that passes.\n")
 }
