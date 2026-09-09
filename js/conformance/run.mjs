@@ -44,12 +44,28 @@ function check(ok, label, detail) {
 }
 const attempt = (fn) => { try { return fn(); } catch (e) { return `THREW: ${e.message}`; } };
 
+// WHICH GROUP PRODUCED WHICH CHECKS. `drove(name)` closes a section: it attributes every check
+// counted since the previous call to `name`, which is a group name spelled EXACTLY as
+// `tools/manifest.json` spells it for this language. The verdict then diffs the two.
+//
+// Attribution by delta rather than by wrapping each `check` keeps the loops below unchanged and
+// works because the sections are contiguous and in order; a group whose loop ran zero times
+// closes with a delta of zero, which is precisely the case this exists to catch.
+const drove = new Map();
+let droveMark = 0;
+function droveGroup(name) {
+  const total = pass + failures.length;
+  drove.set(name, (drove.get(name) ?? 0) + (total - droveMark));
+  droveMark = total;
+}
+
 // ---------------------------------------------------------------- canonical JSON
 for (const v of vectors.canonical) {
   const got = attempt(() => canonicalJSON(v.payload));
   check(got === v.canonical, `canonical/${v.name}`,
         got === v.canonical ? '' : `want ${JSON.stringify(v.canonical)}\n      got  ${JSON.stringify(got)}`);
 }
+droveGroup('canonical');
 
 // `numberHazards` is DELIBERATELY NOT EXECUTED, and reading it is the point. Every case
 // there is a value whose canonical bytes differ between languages, so asserting either
@@ -67,6 +83,7 @@ for (const v of vectors.did) {
   const back = attempt(() => publicKeyHexFromDid(v.did));
   check(back === v.publicHex, `did/decode/${v.did.slice(8, 20)}…`, back === v.publicHex ? '' : `want ${v.publicHex}\n      got  ${back}`);
 }
+droveGroup('did');
 // The other direction of the same door. `did` above is ten positive round-trips, and a decoder
 // that answered `raw.subarray(2)` for anything at all would pass every one of them — so
 // `spec/seam.md` §2's two verdict rules, the multicodec and the length, are pinned from the side
@@ -78,6 +95,7 @@ for (const c of vectors.reject.did) {
   try { publicKeyHexFromDid(c.did); refused = false; } catch { refused = true; }
   check(refused, `did/reject/${c.name}`, `DECODED a did:key it must refuse — ${c.why || ''}`);
 }
+droveGroup('reject.did');
 
 // ---------------------------------------------------------------- the six signed fields
 for (const v of vectors.envelope) {
@@ -96,6 +114,7 @@ for (const v of vectors.envelope) {
   const sig = signEnvelope(seed, fields);
   check(verifyEnvelope({ ...fields, sig }, { recipientDid: from }), 'envelope/round-trip');
 }
+droveGroup('envelope');
 
 // ---------------------------------------------------------------- the refusals
 // The case's message lives under `input`; `recipientDid` (when a case pins one) sits beside
@@ -126,6 +145,7 @@ for (const v of vectors.reject.message) {
   check(accepted === false, `reject/${v.name}`,
         accepted === false ? '' : `ACCEPTED a message it must refuse — ${v.note || v.why || ''}`);
 }
+droveGroup('reject.message');
 
 // ---------------------------------------------------------------- the encoding boundary
 // `reject.encoding` carries RAW DOCUMENT BYTES as hex rather than a parsed value, because the
@@ -165,12 +185,21 @@ for (const v of vectors.reject.message) {
     check(refused, `encoding/refuse/${c.name}`, `ACCEPTED bytes it must refuse — ${c.why || ''}`);
   }
 }
+droveGroup('reject.encoding');
 
 // ---------------------------------------------------------------- the KeyState ratchet
-// Every record in this group VERIFIES. Nothing here is about a bad signature — what is refused
-// is a RESOLVER with no memory of this root, which answers with whatever the presenter attached
-// and therefore honours an older, still-validly-signed KeyState in which a burned op-key was
-// not yet burned.
+// Most records in this group VERIFY, and the ratchet cases are not about a bad signature — what
+// is refused there is a RESOLVER with no memory of this root, which answers with whatever the
+// presenter attached and therefore honours an older, still-validly-signed KeyState in which a
+// burned op-key was not yet burned.
+//
+// The three `keystate-bad-signature` cases are the exception, and they are here because that
+// design made the ROOT SIGNATURE untested: with every record verifying on purpose, nothing
+// asked whether `verifyKeystate` checked one. Measured on 0.3.1 — short-circuit `verifyBytes`
+// inside `verifyKeystate` and this file printed OK at 118. `inline-signature-forged`,
+// `pin-signature-forged` and `unverified-root-rotated-pin` are the three doors an unsigned
+// record comes through: the record the sender attached, the record the caller kept, and a pin
+// claiming a `rootKey` that is neither the DID's own nor anything a lineage could reveal.
 //
 // So the call is the FOUR-argument form, `resolveOpDid(rootDid, inline, checkNow, { pinned })`,
 // and `opts.pinned` is that memory. The two references take these in a different ORDER — Python
@@ -204,6 +233,7 @@ for (const v of vectors.reject.message) {
     }
   }
 }
+droveGroup('reject.keystate');
 
 // ---------------------------------------------------------------- the signed Agent Card envelope
 for (const c of vectors.cardpub) {
@@ -219,6 +249,7 @@ for (const c of vectors.cardpub) {
   const wrong = attempt(() => verifyCardEnvelope(env, 'did:key:zSomeoneElse'));
   check(wrong === null || wrong === false, 'cardpub/wrong-did-refused', `got ${JSON.stringify(wrong).slice(0, 80)}`);
 }
+droveGroup('cardpub');
 // THE NEGATIVE HALF, and the reason everything above it proved less than it looked. Those checks
 // assert only that `verifyCardEnvelope` returned something non-null, and `cardpub/wrong-did-
 // refused` exercises the `expectedDid !== card.did` STRING COMPARISON — which runs perfectly
@@ -238,6 +269,7 @@ for (const c of vectors.reject.cardpub) {
   check(refused, `cardpub/reject/${c.name}`,
         `ACCEPTED a card envelope it must refuse — ${c.why || ''}\n      got ${JSON.stringify(got).slice(0, 80)}`);
 }
+droveGroup('reject.cardpub');
 
 // ---------------------------------------------------------------- cryptobox: open what core sealed
 {
@@ -263,6 +295,7 @@ for (const c of vectors.reject.cardpub) {
           `OPENED a box sealed under different associated data — ${c.why || ''}`);
   }
 }
+droveGroup('cryptobox');
 
 // ---------------------------------------------------------------- device-key binding v2
 //
@@ -310,6 +343,7 @@ for (const c of vectors.reject.cardpub) {
         'the lifted binding must be byte-identical to the accepted one and differ only in who '
         + 'the caller expected — otherwise its refusal pins something other than the pin');
 }
+droveGroup('bindingV2');
 
 // ---------------------------------------------------------------- Web Bot Auth (RFC 9421 subset), verify-only
 for (const c of wba.accept) {
@@ -321,8 +355,55 @@ for (const c of wba.reject) {
   try { got = wbaVerifyRequest(c.headers, { authority: wba.authority, jwks: wba.jwks, now: wba.now }); } catch { got = null; }
   check(got === null, `wba/reject/${c.name}`, `ACCEPTED as ${got}`);
 }
+droveGroup('webBotAuth(wba_vectors)');
+
+// ---------------------------------------------------------------- what the manifest declares
+//
+// A COUNT NOBODY ASSERTS IS A COUNT THAT CAN QUIETLY FALL, and this repository has the
+// measurement: 0.3.1 deleted four guards at once and 0.3.0's suite stayed fully green. A bare
+// floor would not have caught this round's finding either — an emptied, renamed or
+// filter-missed vector group produces zero checks and this file prints OK with a smaller
+// number that nobody reads, because nothing here ever knew what the number should be.
+//
+// `tools/manifest.json` has always listed, per implementation, the groups that implementation
+// covers. NOTHING READ IT. It was documentation, so it could say anything, and a group renamed
+// in the vectors and missed by a loop was invisible on both sides at once. It is the assertion
+// now, and the diff runs BOTH WAYS:
+//
+//   - every group the manifest declares for `js` must have produced at least one check. This
+//     is what catches a group emptied, deleted, or missed by a filter;
+//   - every group this runner drove must be declared. This is what catches a group RENAMED —
+//     the one-way check would go green the moment the runner and the vectors agreed on a new
+//     name the manifest had never heard of.
+//
+// The floor below is the belt: it catches a group that shrinks without emptying, which the
+// diff cannot see.
+const manifest = JSON.parse(readFileSync(join(HERE, '..', '..', 'tools', 'manifest.json'), 'utf8'));
+const declared = manifest.implementations.find((x) => x.lang === 'js')?.groups ?? [];
+check(declared.length > 0, 'manifest/js-declares-its-groups',
+      'tools/manifest.json has no `groups` for lang "js" — this whole section then asserts nothing');
+for (const name of declared) {
+  const n = drove.get(name) ?? 0;
+  check(n > 0, `manifest/group-drove-checks/${name}`,
+        `tools/manifest.json declares \`${name}\` for js and this run produced ${n} checks from it. `
+        + 'An emptied, renamed or filter-missed vector group prints OK; this is what stops it.');
+}
+for (const name of drove.keys()) {
+  check(declared.includes(name), `manifest/group-is-declared/${name}`,
+        `this runner drove \`${name}\` and tools/manifest.json does not declare it for js — `
+        + 'either the manifest is stale or the group was renamed on one side only');
+}
+
+// The absolute floor, and it is DELIBERATELY EXACT rather than generous. Raising it is the
+// correct response to adding a check; being unable to run it down is the point.
+const FLOOR = 149;
 
 // ---------------------------------------------------------------- verdict
+if (pass + failures.length < FLOOR) {
+  failures.push(`suite/check-count-floor\n      only ${pass + failures.length} checks ran and at `
+    + `least ${FLOOR} were expected. Something stopped being checked; the rows above will not `
+    + 'say so, because a check that does not run reports nothing.');
+}
 if (failures.length) {
   console.log(`FAILED — ${failures.length} of ${pass + failures.length} checks:\n`);
   for (const f of failures) console.log(`  ✗ ${f}`);

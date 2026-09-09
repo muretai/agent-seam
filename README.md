@@ -29,13 +29,29 @@ of them owns the contract.
 ## Run
 
 ```sh
-npm test               # manifest 17 · JS conformance 118
-cd go && go run ./conformance   # Go:     OK — 63 checks
-cd rust && cargo run --quiet --bin conformance   # Rust: OK — 63 checks
-npm run test:py        # Python: closure 220 · wire vectors 180 · web bot auth 5 accepted / 25 refused
+npm test               # manifest 17 · JS conformance 149
+cd go && go run ./conformance   # Go:     OK — 88 checks
+cd rust && cargo run --quiet --bin conformance   # Rust: OK — 88 checks
+npm run test:py        # Python: closure 220 · wire vectors 288 · web bot auth 5 accepted / 25 refused
                        #         · keybinding · cryptobox · gateway · neturl
-                       #         · ed25519 backend agreement 313 (library vs pure-python)
+                       #         · ed25519 backend agreement 316 (library vs pure-python)
 ```
+
+Each of those numbers is a FLOOR the runner asserts, not a number it merely prints, because a
+count nobody asserts is a count that can quietly fall. Raising one is the correct response to
+adding a check.
+
+A floor alone is not enough: it does not say WHICH group stopped running, and a group renamed
+rather than deleted does not move the total at all. So `tools/manifest.json`
+`implementations[].groups` — which nothing read until now — is an assertion too. The
+JavaScript, Go and Rust runners attribute every check they make to a group name spelled
+exactly as the manifest spells it and diff the two BOTH WAYS: a declared group that produced
+no checks is red, and a driven group the manifest does not declare is red. Go and Rust hold
+their `skips` to the same standard from the other side. The Python runner does not attribute
+per group — its checks are spread across a dozen functions and an attribution that were merely
+plausible would be the very defect this is about — so it asserts instead that every declared
+group resolves to a non-empty place in the vectors, and that every group in the vectors is
+claimed by some implementation.
 
 Go and Rust print two skips: `reject.keystate` and `reject.cardpub`, SKIPPED ON PURPOSE.
 Neither implements KeyState or the card envelope, and a group nobody loops over looks exactly
@@ -107,21 +123,30 @@ files — and `npm test` proves the manifest describes `js/seam.mjs` exactly.
 `agent-entry-serverless` vendors the whole door from agent-entry, not this repository; the seam
 reaches it inside the door.
 
-## A gap this repository knows about
+## A gap this repository knew about, and the one it still has
 
-`canonical/key-ordering-unicode` is named "keys sort by CODE POINT, not by UTF-16 unit", and
-its keys are `z`, `a`, `群`, `A`. Every one of those is inside the Basic Multilingual Plane,
-where code-point order and UTF-16 code-unit order are the same — so the case cannot tell the
-two apart, and no other case has a key outside the BMP either. An implementation that sorted
-keys by UTF-16 code unit, which is exactly what a plain JavaScript `.sort()` does, would pass
-all 180 checks and still disagree with Python the first time a signed object carried an emoji
-or a rare CJK character as a KEY.
+`canonical/key-ordering-unicode` was named "keys sort by CODE POINT, not by UTF-16 unit", and
+its keys were `z`, `a`, `群`, `A` — every one inside the Basic Multilingual Plane, where
+code-point order and UTF-16 code-unit order are the same. The case could not tell the two
+apart, and no other case had a key outside the BMP either, so an implementation that sorted
+keys the way a plain JavaScript `.sort()` does passed all 180 checks and would have disagreed
+with Python the first time a signed object carried an emoji as a KEY. The Go port found it.
 
-All three references here are correct — they were checked by hand against Python on
-`{"\U00010000": 1, "\uFFFD": 2}`, and all three write `{"\uFFFD":2,"\U00010000":1}`. The gap is
-in the vectors, not in the code, and it was found by writing the third implementation, which
-is the argument for having one. Closing it means a new case in the generator and a new pin in
-every consumer, so it is a deliberate change rather than a patch.
+**Closed.** `canonical/key-ordering-astral` is `{"\U0001F600": 1, "\uFFFD": 2}` — an astral key
+beside a high-BMP one, which is the only shape where the two orders separate (U+1F600 leads
+with the UTF-16 unit `0xD83D`, below U+FFFD's single `0xFFFD`). The generator asserts that the
+pair really does discriminate, and `key-ordering-unicode` stays beside it as the statement of
+the rule that a wrong implementation still passes. Measured: flip `canonicalJSON` to
+`Object.keys(v).sort()` and exactly one check fails, the astral one.
+
+**Still open: duplicate JSON keys are LAST-WINS by agreement rather than by rule.** All four
+references were measured taking the last occurrence and `reject.encoding.accept/
+duplicate-key-last-wins` now pins that, so a fifth port that picks the first, or refuses, is
+red instead of silently signing different bytes. Refusing a duplicate key outright is the
+stronger rule — `{"a":1,"a":2}` and `{"a":2}` are two wire documents with one canonical form,
+which is the same collision the byte order mark is refused for — and it is not the rule today
+because closing it means a duplicate-detecting parse boundary in four languages and a change
+to what every consumer's `canonicalFromJSON` accepts. `spec/seam.md` §1.2 argues it out.
 
 ## Adding a language
 

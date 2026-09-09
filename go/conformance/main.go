@@ -29,6 +29,68 @@ var (
 	failures []string
 )
 
+// WHICH GROUP PRODUCED WHICH CHECKS. droveGroup closes a section: it attributes every check
+// counted since the previous call to name, which is a group name spelled EXACTLY as
+// tools/manifest.json spells it for this language. The verdict then diffs the two.
+//
+// Attribution by delta rather than by wrapping each check keeps the loops below unchanged and
+// works because the sections are contiguous; a group whose loop ran zero times closes with a
+// delta of zero, which is precisely the case this exists to catch.
+var (
+	drove      = map[string]int{}
+	droveOrder []string
+	droveMark  int
+)
+
+func droveGroup(name string) {
+	total := pass + len(failures)
+	if _, seen := drove[name]; !seen {
+		droveOrder = append(droveOrder, name)
+	}
+	drove[name] += total - droveMark
+	droveMark = total
+}
+
+// findManifest locates tools/manifest.json the same way findVectors locates the vectors. A
+// missing manifest is fatal rather than skipped: the whole point of reading it is that the
+// coverage claim cannot be quietly absent.
+func findManifest() (string, []byte) {
+	for _, p := range []string{
+		"../tools/manifest.json",
+		"../../tools/manifest.json",
+		"tools/manifest.json",
+	} {
+		if b, err := os.ReadFile(p); err == nil {
+			abs, _ := filepath.Abs(p)
+			return abs, b
+		}
+	}
+	fmt.Fprintln(os.Stderr, "error: tools/manifest.json not found — run this from the go/ directory")
+	os.Exit(2)
+	return "", nil
+}
+
+// strings reads a JSON array of strings out of a decoded manifest entry.
+func stringsOf(m map[string]any, k string) []string {
+	raw, _ := m[k].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func contains(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func check(ok bool, label, detail string) {
 	if ok {
 		pass++
@@ -118,6 +180,7 @@ func main() {
 		check(string(got) == want, "canonical/"+name,
 			fmt.Sprintf("got  %s\n      want %s\n      %s", got, want, str(m, "why")))
 	}
+	droveGroup("canonical")
 
 	// ---- numberHazards: values a signer must never emit. The JavaScript runner counts
 	// these and leaves them; here they are executed, because a Go encoder that quietly
@@ -129,6 +192,7 @@ func main() {
 		check(err != nil, "numberHazard/"+str(m, "name"),
 			"rendered a value Python and JavaScript spell differently ("+str(m, "pythonCanonical")+" against "+str(m, "javascriptWouldWrite")+")")
 	}
+	droveGroup("numberHazards")
 
 	// ---- did:key, both directions
 	dids, _ := v["did"].([]any)
@@ -152,6 +216,7 @@ func main() {
 		check(err == nil && fmt.Sprintf("%x", back) == str(m, "publicHex"), "did/decode/"+str(m, "publicHex")[:8],
 			fmt.Sprintf("got %x, want %s", back, str(m, "publicHex")))
 	}
+	droveGroup("did(ed25519)")
 
 	// ---- the signing envelope: the exact bytes that are signed
 	envs, _ := v["envelope"].([]any)
@@ -175,6 +240,7 @@ func main() {
 	sig, err := e.Sign(priv)
 	check(err == nil && e.Verify(sig, did), "envelope/round-trip",
 		"this build cannot verify what it just signed")
+	droveGroup("envelope")
 
 	// ---- the refusals
 	rejects, _ := v["reject"].(map[string]any)
@@ -204,6 +270,7 @@ func main() {
 			check(true, "did/reject/"+str(m, "name"), "")
 		}
 	}
+	droveGroup("reject.did")
 
 	msgs, _ := rejects["message"].([]any)
 	for _, c := range msgs {
@@ -239,6 +306,7 @@ func main() {
 		check(refused, "reject/"+str(m, "name"),
 			"ACCEPTED a message it must refuse — "+str(m, "note"))
 	}
+	droveGroup("reject.message")
 
 	// ---- the encoding boundary: raw document BYTES, through the supported path
 	//
@@ -284,6 +352,7 @@ func main() {
 		check(err != nil, "encoding/refuse/"+str(m, "name"),
 			"ACCEPTED bytes it must refuse — "+str(m, "why"))
 	}
+	droveGroup("reject.encoding")
 
 	// ---- reject.keystate: SKIPPED HERE, AND SAID SO.
 	//
@@ -317,6 +386,77 @@ func main() {
 	check(cardSkipped > 0, "cardpub/skipped-deliberately",
 		"reject.cardpub is missing or empty — this runner skips the group ON PURPOSE and "+
 			"cannot skip a group that is not there")
+
+	// ---- what the manifest declares this implementation covers.
+	//
+	// A COUNT NOBODY ASSERTS IS A COUNT THAT CAN QUIETLY FALL, and this repository has the
+	// measurement: 0.3.1 deleted four guards at once and 0.3.0's suite stayed fully green. A
+	// bare floor would not have caught this round's finding either — an emptied, renamed or
+	// filter-missed vector group produces zero checks and this file prints OK with a smaller
+	// number nobody reads, because nothing here ever knew what the number should be.
+	//
+	// tools/manifest.json has always listed, per implementation, the groups it covers and the
+	// groups it deliberately skips. NOTHING READ IT. It was documentation, so it could say
+	// anything, and a group renamed in the vectors and missed by a loop was invisible on both
+	// sides at once. It is the assertion now, and the diff runs BOTH WAYS: every declared group
+	// must have produced a check (an emptied or missed group), and every group driven must be
+	// declared (a group RENAMED, which the one-way check goes green on the moment the runner
+	// and the vectors agree on a name the manifest never heard of).
+	//
+	// The skips are held to the same standard from the other side: a group this runner asserts
+	// it is skipping must be listed as a skip, and must not also be listed as covered.
+	mpath, mraw := findManifest()
+	man, err := decode(mraw)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: tools/manifest.json is not readable:", err)
+		os.Exit(2)
+	}
+	impls, _ := man["implementations"].([]any)
+	var mine map[string]any
+	for _, it := range impls {
+		if m, ok := it.(map[string]any); ok && str(m, "lang") == "go" {
+			mine = m
+		}
+	}
+	check(mine != nil, "manifest/go-is-an-implementation",
+		"tools/manifest.json ("+mpath+") has no entry with lang \"go\"")
+	declared := stringsOf(mine, "groups")
+	skips := stringsOf(mine, "skips")
+	check(len(declared) > 0, "manifest/go-declares-its-groups",
+		"the manifest lists no `groups` for go — this whole section then asserts nothing")
+	for _, name := range declared {
+		check(drove[name] > 0, "manifest/group-drove-checks/"+name,
+			fmt.Sprintf("tools/manifest.json declares `%s` for go and this run produced %d checks "+
+				"from it. An emptied, renamed or filter-missed vector group prints OK; this is "+
+				"what stops it.", name, drove[name]))
+	}
+	for _, name := range droveOrder {
+		check(contains(declared, name), "manifest/group-is-declared/"+name,
+			"this runner drove `"+name+"` and the manifest does not declare it for go — either "+
+				"the manifest is stale or the group was renamed on one side only")
+	}
+	// The two groups asserted-and-skipped above must be exactly the two the manifest calls
+	// skips, and a group cannot be both covered and skipped.
+	for _, name := range []string{"reject.keystate", "reject.cardpub"} {
+		check(contains(skips, name), "manifest/skip-is-declared/"+name,
+			"this runner skips `"+name+"` by name and the manifest does not list it under `skips`")
+	}
+	for _, name := range skips {
+		check(!contains(declared, name), "manifest/skip-is-not-also-covered/"+name,
+			"the manifest lists `"+name+"` as both covered and skipped for go")
+		check(drove[name] == 0, "manifest/skipped-group-drove-nothing/"+name,
+			"the manifest calls `"+name+"` a skip and this runner attributed checks to it")
+	}
+
+	// The absolute floor, DELIBERATELY EXACT rather than generous. Raising it is the correct
+	// response to adding a check; being unable to run it down is the point. It catches a group
+	// that shrinks without emptying, which the diff above cannot see.
+	const floor = 88
+	if pass+len(failures) < floor {
+		failures = append(failures, fmt.Sprintf("suite/check-count-floor\n      only %d checks ran "+
+			"and at least %d were expected. Something stopped being checked; the rows above will "+
+			"not say so, because a check that does not run reports nothing.", pass+len(failures), floor))
+	}
 
 	if len(failures) > 0 {
 		fmt.Printf("\nFAILED — %d of %d checks:\n\n", len(failures), pass+len(failures))

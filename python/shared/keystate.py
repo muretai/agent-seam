@@ -313,6 +313,43 @@ def _payload(fields: dict[str, Any]) -> bytes:
     return crypto.canonical({k: fields.get(k) for k in _signed_names(fields)})
 
 
+def _epoch_seconds(name: str, v: Any, *, nullable: bool = False) -> int | None:
+    """A signed timestamp field, minted as the ONE type every language spells alike.
+
+    THE NUMBER HAZARD, in the only three fields of a KeyState that are signed timestamps.
+    `crypto.canonical` renders a whole-number float the way CPython's repr does — `1.0`, not
+    `1` — while JavaScript, Go and Rust all write `1`, so a KeyState carrying one is signed
+    over bytes no other language can reproduce and verifies in Python and NOWHERE ELSE. It
+    does not fail loudly: the record is authentic, `verify_keystate` says True here, and the
+    peer simply cannot resolve the op-key and dies as an unknown signer. See
+    `vectors/wire_vectors.json` numberHazards/`integral-float-zero`, which is this exact bug
+    in `notBefore`, fixed 2026-08-07 by the `int()` two lines below.
+
+    `notAfter` never got that cast. It was passed through as given, so
+    `make_keystate(..., not_after=time.time() + 3600)` on a whole second minted a
+    Python-only KeyState — measured: `notAfter: 1784277281.0` signs
+    `{"...","notAfter":1784277281.0,...}`, `verify_keystate` accepts it and the JavaScript
+    twin refuses the identical record. It is a signed timestamp like the other two and it is
+    cast like the other two now.
+
+    A TYPE GUARD as well as a cast, because `int()` is not one. `int(True)` is 1 — a
+    delegation that expired in 1970 — and `int("1784277281")` is a silent success on a string
+    the caller never meant as a number. Neither is coercible to a timestamp anybody intended,
+    so both are refused HERE, at the mint, which is the only place the type can still be
+    fixed for the life of the record. A verifier that met one afterwards could only guess."""
+    if v is None:
+        if nullable:
+            return None
+        raise TypeError(f"make_keystate: {name} must be a number, not None")
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError(
+            f"make_keystate: {name} must be an integer epoch second, not {type(v).__name__} "
+            f"({v!r}). A signed timestamp has one spelling on this wire.")
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        raise ValueError(f"make_keystate: {name} is not a finite epoch second ({v!r})")
+    return int(v)
+
+
 def make_keystate(root_did: str, *, epoch: int, op_did: str, op_next_hash: str,
                   ts: float, root_sign: Callable[[bytes], str],
                   root_key: str | None = None, root_next_hash: str = "",
@@ -345,10 +382,17 @@ def make_keystate(root_did: str, *, epoch: int, op_did: str, op_next_hash: str,
         # `0.0` is JavaScript's `0`, which makes every KeyState unverifiable outside
         # Python 100% of the time. Same defect and same remedy as the 2026-07-17
         # message-timestamp flip: mint the reproducible type, never coerce on verify.
-        # `notAfter` is passed through as given (None or a caller value) and `ts` is
-        # int for the same reason. See vectors/wire_vectors.json `timestampNote` —
-        # "Never coerce inside a payload builder".
-        "notBefore": int(not_before), "notAfter": not_after, "ts": int(ts),
+        # See vectors/wire_vectors.json `timestampNote` — "Never coerce inside a
+        # payload builder".
+        #
+        # ALL THREE go through `_epoch_seconds` now. `notAfter` was the one field of the
+        # three that was passed through as given, and it is the one that is a signed
+        # timestamp AND nullable, so the omission read as deliberate: `None` has to survive.
+        # It does — `nullable=True` — and a whole-number float no longer does. Read
+        # `_epoch_seconds` for what that cost before it was cast.
+        "notBefore": _epoch_seconds("not_before", not_before),
+        "notAfter": _epoch_seconds("not_after", not_after, nullable=True),
+        "ts": _epoch_seconds("ts", ts),
     }
     # T142 B2, ONLY when a PQ key is actually being bound. `_signed_names` selects the
     # field list by PRESENCE, so writing the key unconditionally (even as "") moved every
@@ -529,12 +573,19 @@ def _usable_pin(pinned: Any, root_did: str) -> bool:
     classes of legitimately pinned record cannot be judged here, and refusing them would
     break working identities to defend against a caller that does not exist yet:
 
-      - ROOT-ROTATED (`rootKey` != the DID's own key). Its authorization is a LINEAGE, and
+      - ROOT-ROTATED (`rootKey` != the DID's own key). Its AUTHORIZATION is a LINEAGE, and
         `resolve_op_did` has no lineage parameter, so `verify_keystate` answers False for
         every one of them. The resolver would fall back to the root DID and every message
         that peer signs with its live op-key would die as -32001 -- the exact failure this
         file's other comments are about. The store held the lineage and checked it; this
         function was never given it.
+
+        What IS judged, and was not until the `unverified-root-rotated-pin` vector, is that
+        such a record is SIGNED BY THE ROOTKEY IT CLAIMS. Every genuine root-rotated KeyState
+        is (`_verify_root_lineage` requires it of every link), so nothing legitimate is lost,
+        and without it the branch was not "a rotation I cannot judge" but "any pin at all":
+        `rootKey: "dede...de"` with a junk sig went through and `resolve_op_did` answered the
+        stranger's opDid.
       - A P-256 cold root on a node without the optional `cryptography` backend -- the
         headline case in this module's own docstring. `crypto.verify` answers False there,
         so re-verifying would make the resolver's answer depend on an installed package:
@@ -553,14 +604,38 @@ def _usable_pin(pinned: Any, root_did: str) -> bool:
     did_key = _did_pub_hex(root_did)
     if did_key is None:
         return False                      # a DID we cannot resolve authorizes nothing
-    if pinned.get("rootKey") != did_key:
-        return True                       # root-rotated: not this function's to judge
     try:
         curve, _pub = crypto.key_from_did(root_did)
     except Exception:
         return False
     if curve == "p256" and not crypto.P256_AVAILABLE:
         return True                       # cannot check it here; the store already did
+    if pinned.get("rootKey") != did_key:
+        # ROOT-ROTATED. The LINEAGE is still not this function's to judge -- it was never
+        # handed one -- but the record's OWN SIGNATURE is, and that is the half this branch
+        # used to skip. `return True` here made the branch mean "any pin whose rootKey is not
+        # the DID key", not "a rotation I cannot judge", and the two are not the same set:
+        # `rootKey: "dede...de"` is not a rotation, it is 32 bytes of nothing, and it took this
+        # path unverified. `resolve_op_did` then answered that record's `opDid` -- a stranger's
+        # key -- where the JavaScript twin, whose `verifyKeystate` refuses root rotation
+        # outright, answered the root. One wire, two references, opposite answers.
+        #
+        # Every link of `_verify_root_lineage` is required to be signed by its own rootKey and
+        # every genuine root-rotated KeyState is, so requiring it here narrows the branch to
+        # exactly what the paragraph above claims for it and costs no legitimate record. What
+        # is still NOT required is that the rootKey be AUTHORIZED; that is the lineage, and it
+        # belongs to the store that pinned this.
+        #
+        # The p256-without-backend case is checked ABOVE this now rather than below it, so a
+        # hardware-rooted pin on a node with no `cryptography` still declines to judge rather
+        # than failing a signature it cannot compute.
+        try:
+            sig = crypto.b64_strict(pinned.get("sig"))
+            if sig is None:
+                return False
+            return _verify_pub_hex(pinned["rootKey"], sig, _payload(pinned))
+        except Exception:
+            return False                  # "Never raises" -- `_payload` canonicalizes untrusted input
     # No `now`: the pin's own validity window is not what is being asked. An EXPIRED pin is
     # still the record we hold about this identity (agreement-table row p09), and the twin
     # omits the clock here for the same reason.

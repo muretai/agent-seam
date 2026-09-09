@@ -161,6 +161,66 @@ def _small_order_r_signature(seed: bytes, msg: bytes, r_bytes: bytes) -> bytes:
     return r_bytes + s.to_bytes(32, "little")
 
 
+def _torsion_forgery(seed: bytes, base_msg: bytes) -> tuple[bytes, bytes, bytes]:
+    """A MIXED-ORDER key and a signature only the COFACTORED equation accepts.
+
+    The fourteen-entry table above is about SMALL-ORDER points. It says nothing about which
+    equation is asked once a key is past it, and there are two:
+
+        cofactorless (RFC 8032 §5.1.7)     [S]B == R + [h]A
+        cofactored   (ZIP-215)           [8][S]B == [8]R + [8][h]A
+
+    The cofactored form is strictly weaker — the multiply annihilates any torsion component —
+    and RFC 8032 calls the strict check "sufficient, but not required", so both are conforming
+    RFC 8032 and only one is this wire. Nothing in this corpus could tell them apart: the two
+    differ ONLY on torsion-carrying inputs, and every other case here is torsion-free.
+    Measured — flip `shared/crypto`'s pure backend to the cofactored equation and this file
+    printed OK at 313.
+
+    Publish `A = A0 + T` where `A0 = [a]B` is the honest public point and `T = (0, -1)` has
+    ORDER 2. `A` then has order `2l`: MIXED, not small, so the table does not refuse it. Sign
+    with the honest secret over `A`'s encoding, and
+
+        [S]B = R + [h]A0 = R + [h](A - T) = R + [h]A - [h]T
+
+    leaves the residual `-[h]T`, which vanishes under the cofactor and does not otherwise —
+    so the cofactored equation holds always and the cofactorless one only when `h` is EVEN.
+    The message is ground until `h` is odd, which is asserted: with an even `h` this is a
+    valid signature and the case would be one that cannot fail.
+
+    Returns (public key, signature, message). Plain integers, like the helper above, so the
+    library child can mint it too."""
+    import hashlib
+    q, l = P, L
+    inv = lambda x: pow(x, q - 2, q)                              # noqa: E731
+
+    hs = hashlib.sha512(seed).digest()
+    a = 2 ** 254 + sum(2 ** i * ((hs[i // 8] >> (i % 8)) & 1) for i in range(3, 254))
+    a0 = crypto.ed25519_public_from_seed(seed)
+    # A0 + (0, -1) = (-x, -y): y negates mod q and x's sign bit flips. Pure byte work — no
+    # curve arithmetic — and checked against a general Edwards addition when this was written.
+    y = int.from_bytes(a0, "little") & ((1 << 255) - 1)
+    tors = bytearray(((q - y) % q).to_bytes(32, "little"))
+    tors[31] |= (1 - (a0[31] >> 7)) << 7
+    pub = bytes(tors)
+    assert pub not in {bytes.fromhex(k) for k in SMALL_ORDER}, \
+        "the mixed-order key landed in the small-order table — the table would refuse it"
+    for n in range(256):
+        msg = base_msg + b" torsion-%d" % n
+        r = int.from_bytes(hashlib.sha512(hs[32:] + msg).digest(), "little") % l
+        # R = [r]B is the first 32 bytes of the HONEST signature over the same message: the
+        # RFC 8032 nonce is a function of the seed and the message only, never of the key.
+        rr = crypto.ed25519_sign(seed, msg)[:32]
+        h = int.from_bytes(hashlib.sha512(rr + pub + msg).digest(), "little") % l
+        if h % 2 == 1:                       # [h]T != identity, so the residual survives
+            sig = rr + ((r + h * a) % l).to_bytes(32, "little")
+            assert rr not in {bytes.fromhex(k) for k in SMALL_ORDER}, \
+                "R landed in the small-order table — the table would refuse it, not the equation"
+            assert int.from_bytes(sig[32:], "little") < l, "S is not a canonical scalar"
+            return pub, sig, msg
+    raise AssertionError("no odd h in 256 tries — the grind is broken, not unlucky")
+
+
 def _envelope_seed() -> bytes:
     """A seed whose signature's base64 contains BOTH '+' and '/', so the base64url case
     below is a real alternative spelling rather than the same string twice."""
@@ -213,6 +273,18 @@ def corpus() -> list[tuple[str, object, object]]:
         # …and through the DID path, which is how it would actually arrive on the wire.
         case(f"small-order key {hexk[:8]}… via did:key", False,
              lambda k=k: crypto.verify(crypto.did_from_public(k), k + bytes(32), msg))
+
+    # ---- a MIXED-ORDER key: the verification EQUATION, which the table above does not pin.
+    # A cofactored (ZIP-215) verifier accepts this and a cofactorless one refuses it, and
+    # nothing else in this corpus separates the two. See `_torsion_forgery` and
+    # `spec/seam.md` §2.1; the wire vector is `reject.message/torsion-cofactored-only`.
+    _tpub, _tsig, _tmsg = _torsion_forgery(seed, msg)
+    case("mixed-order key, cofactored equation holds, cofactorless does not", False,
+         lambda: crypto.ed25519_verify(_tpub, _tsig, _tmsg))
+    case("mixed-order key, through verify(did:key)", False,
+         lambda: crypto.verify(crypto.did_from_public(_tpub), _tsig, _tmsg))
+    case("mixed-order key, through verify_raw(pub)", False,
+         lambda: crypto.verify_raw(_tpub, _tsig, _tmsg))
 
     # ---- a small-order R under an HONEST key. `cryptography` accepts the first of these
     # and node's `crypto.verify` refuses it — the same library family, different builds, so

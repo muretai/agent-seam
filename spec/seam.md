@@ -60,6 +60,17 @@ literally, lowercase `\u00xx` for the control characters JSON must escape and Py
 escapes (`\n`, `\t`, …) where Python uses them, `/` and DEL unescaped, no Unicode normalisation,
 integers bare. `NaN`/`Infinity` are refused.
 
+**Key order is by code point, and only one shape of vector can prove it.** Below U+D800 a
+UTF-16 code-unit sort and a code-point sort are the same order, so a group of BMP keys states
+the rule and cannot fail: a port sorting the way JavaScript's default `Array.prototype.sort`
+does reproduces its bytes exactly. The two orders separate only where an ASTRAL key sits beside
+a HIGH-BMP one. `canonical/key-ordering-astral` is that pair — U+1F600 leads with the UTF-16
+unit `0xD83D`, which is below U+FFFD's single `0xFFFD`, so a unit sort emits the emoji first
+and this contract emits it second — and `canonical/key-ordering-unicode` beside it is the
+statement of the rule that a wrong implementation still passes. Both are kept, and the
+generator asserts of the astral pair that the two orders actually disagree, because a vector
+for an order no pair separates is the defect it exists to close wearing the fix's clothes.
+
 `numberHazards` lists values whose canonical bytes differ between languages (floats). They are
 **not** in `canonical` on purpose: a signer must never emit one (`signMustNotEmit`), and a
 verifier that meets one may report honestly that it cannot verify that artifact. Every
@@ -150,6 +161,33 @@ path this document named, which is the path an implementer copies. `reject.encod
 utf16le-no-bom` pins it, and it is a separate case from the mark because it is a separate clause
 of the guard.
 
+### 1.2 One name, twice: duplicate keys are last-wins
+
+RFC 8259 §4 says object names **SHOULD** be unique and does not say what happens when they are
+not, so every parser picks and no two need pick alike. `{"a":1,"a":2}` is a document a first-
+wins reader canonicalizes to `{"a":1}` and a last-wins reader to `{"a":2}` — one wire document,
+two signed byte strings, and nothing anywhere reports a problem.
+
+**The rule is LAST-WINS**, pinned by `reject.encoding.accept/duplicate-key-last-wins`, and it
+is the rule because it is what all four references were measured doing (Python's `json`,
+JavaScript's `JSON.parse`, `seam.Unmarshal`, `serde_json`). The generator asserts that a
+first-wins reader over those same bytes produces different canonical bytes, so the case can
+actually fail; the port this is aimed at is the fifth one, in a language whose parser picks
+the other occurrence or refuses outright, which until now would have signed different bytes in
+silence.
+
+**Refusing a duplicate key is the stronger rule, and it is not this contract today.** It is
+stronger by exactly the argument §1.1 and §1.1.1 make: `{"a":1,"a":2}` and `{"a":2}` are two
+distinct wire documents that collapse to one canonical byte string, so a signature over the
+second also authenticates the first at any receiver that reads the raw document with different
+duplicate semantics than the canonicaliser did. That is the BOM collision one layer in. It is
+not the rule because closing it means a duplicate-detecting parse boundary in four languages —
+`object_pairs_hook` in Python and a check in `seam.Unmarshal` are small, a JSON tokenizer in
+JavaScript and a custom `serde` visitor in Rust are not — and because it would change what
+every consumer's `canonicalFromJSON` accepts. Pinning the agreement the four references already
+have is what a vector is for; tightening the rule is a decision with a cascade, and it is
+recorded here as open rather than assumed.
+
 ## 2. Keys and DIDs
 
 An identity is a 32-byte Ed25519 seed. Its DID is `did:key:z` + base58btc(multicodec prefix
@@ -215,6 +253,41 @@ separately, because it costs one line and buys non-repudiation: without it the h
 private key can mint a second, differently-spelled signature over a message they have already
 signed, and both verify. Anything downstream treating the signature bytes as a message's
 identity — a dedup key, a replay guard, an idempotency token — is then defeated by the sender.
+
+**And the equation itself is pinned, because refusing the fourteen encodings does not pin it.**
+There are two verification equations in circulation and the small-order table is orthogonal to
+both:
+
+    cofactorless (RFC 8032 §5.1.7)     [S]B == R + [h]A
+    cofactored   (ZIP-215)           [8][S]B == [8]R + [8][h]A
+
+The cofactored form is strictly **weaker** — multiplying through by the cofactor annihilates
+any torsion component, so it accepts everything the cofactorless form accepts and more. RFC
+8032 calls the strict check "sufficient, but not required", so a port that writes the
+cofactored equation is conforming to RFC 8032 and divergent from this wire, and the divergence
+is silent: the two differ only on inputs carrying torsion, and every other signature in the
+vectors is torsion-free. **A verifier here MUST use the cofactorless equation.**
+
+`reject.message/torsion-cofactored-only` is the case that can fail, and it is closable by a
+vector — it does not need a spec sentence alone. Publish `A = A0 + T`, where `A0 = [a]B` is an
+honest public point and `T = (0, -1)` is the point of **order 2**. `A` then has order `2l`: it
+is MIXED order, not small order, so it is not in the fourteen-entry table and no small-order
+check refuses it, and the `did:key` codec spells it like any other key. Sign with the honest
+secret and the honest RFC 8032 nonce but over `A`'s encoding — `R = [r]B`,
+`h = H(R ‖ enc(A) ‖ M) mod l`, `S = r + ha` — and then
+
+    [S]B = R + [h]A0 = R + [h](A - T) = R + [h]A - [h]T
+
+so the residual is exactly `-[h]T`. Multiply by 8 and it vanishes, because `T` has order 2: the
+cofactored equation holds for every `h`, and the cofactorless one holds only when `[h]T` is the
+identity, i.e. only when `h` is even. The single condition the case needs is an **odd h**, which
+the generator grinds the `messageId` for and then asserts — with an even `h` the signature is
+simply valid and the vector would be a check that cannot fail. It also asserts that neither `A`
+nor `R` is in the small-order table, that `S` is a canonical scalar and that the base64 is
+canonical, so that nothing but the equation can be what refuses the message. All four
+references refuse it today: `node:crypto` and `cryptography` through OpenSSL, Go's
+`crypto/ed25519`, `ed25519-dalek`'s `verify_strict`, and Python's pure backend, whose last line
+is literally `[S]B == R + [h]A`.
 
 **The codec is not where this belongs, and the `did` group proves it.** `did` still round-trips
 `publicHex` `0000…0000` (a point of order 4) and `ffff…ffff` in all four implementations, and
@@ -436,6 +509,28 @@ signature would land a new definition beside an unchanged call — `now` read as
 KeyState — with every test in both repositories still green. Where the pin STORE lives is the
 door's decision, not the wire's; every caller passing three arguments is on the first-contact
 answer, revocation and all, and should say so rather than believe otherwise.
+
+**The root signature is a separate rule from the ratchet, and it needs its own cases.** Every
+record in a rollback pair verifies on purpose — the ratchet is about freshness, not
+authenticity — with the consequence that nothing in the group asked whether the root signature
+was checked at all. It was not: short-circuiting the signature check inside `verify_keystate`
+left the Python suite green at 180/180 and short-circuiting it inside `verifyKeystate` left
+`js/conformance/run.mjs` green at 118/118, both measured on 0.3.1. The one guard deciding
+whether a KeyState was minted by the identity it names was deletable by the suite's own
+measure. Three cases close the three doors an unsigned record comes through:
+`inline-signature-forged` (the record the sender attached), `pin-signature-forged` (the record
+the caller kept), and `unverified-root-rotated-pin`.
+
+The third is its own rule. A **root-rotated** KeyState — `rootKey` != the DID's own key — is
+authorized by a LINEAGE, and the resolver has no lineage parameter, so it cannot judge one and
+must not refuse it merely for that. Python declined to judge them and therefore declined to
+check anything at all about them, which is not the same set: `rootKey: "dede…de"` is not a
+rotation, it is 32 bytes of nothing, and it took the same branch. Measured on 0.3.1, Python's
+`resolve_op_did` answered the stranger's `opDid` for that pin where the JavaScript twin
+answered the root — one wire, two references, opposite answers, and no vector could see it.
+The rule: **a root-rotated pin must still be signed by the `rootKey` it claims**, which every
+genuine one is (each link of a root lineage is required to be) and which no forged one can be.
+Its lineage remains the store's business.
 
 Go and Rust implement no KeyState. Their runners **skip this group by name and print the skip**,
 asserting only that the group is present and non-empty, because a group nobody loops over is

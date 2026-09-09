@@ -102,6 +102,25 @@ def _canonical_cases() -> list[dict]:
          "NOT normalized: canonical JSON must never NFC/NFD the input"),
         ("key-ordering-unicode", {"z": 1, "a": 2, "群": 3, "A": 4},
          "keys sort by CODE POINT (Python str order), not by UTF-16 unit or locale"),
+        # The case above says the rule and CANNOT FAIL. Every key in it is below U+D800, and
+        # under U+D800 a UTF-16 code-unit sort and a code-point sort are the same order, so a
+        # port that sorts the way JavaScript's default `Array.prototype.sort` does reproduces
+        # its bytes exactly. The Go port found this: the group asserted a property no case
+        # discriminated.
+        #
+        # The orders separate only where one key is ASTRAL and another is high BMP, and this
+        # is the pair that separates them. U+1F600 is the surrogate pair D83D DE00, so its
+        # first code unit is 0xD83D; U+FFFD is the single unit 0xFFFD. By CODE UNIT 0xD83D <
+        # 0xFFFD, so a UTF-16 sort puts the emoji FIRST. By CODE POINT 0xFFFD (65533) <
+        # 0x1F600 (128512), so the contract puts it SECOND. Two keys, and the canonical bytes
+        # of the two orders differ.
+        ("key-ordering-astral", {"\U0001F600": 1, "\uFFFD": 2},
+         "THE key-ordering case that can fail. An ASTRAL key beside a HIGH-BMP one is the only "
+         "shape where sorting by UTF-16 code unit and sorting by code point disagree: U+1F600 "
+         "leads with unit 0xD83D, which is BELOW U+FFFD's single 0xFFFD, so a UTF-16 sort "
+         "emits the emoji first and the contract emits it second. `key-ordering-unicode` "
+         "above states the rule; every key in it is under U+D800, where the two orders "
+         "coincide, so it is green in a port that gets this wrong."),
         ("negative-and-zero", {"a": 0, "b": -1}, "integers render bare, no + or leading zeros"),
         ("large-int-within-double", {"a": 9007199254740991},
          "2**53-1, the largest integer a JavaScript Number holds exactly. Signed "
@@ -111,6 +130,14 @@ def _canonical_cases() -> list[dict]:
          "byte-for-byte across languages. That is exactly why float timestamps looked "
          "fine for a year — they are reproducible until one lands on a whole second"),
     ]
+    # The discriminating pair is a PROPERTY of these two characters, so it is measured here
+    # rather than asserted in prose. `utf-16-be` bytes compare exactly as UTF-16 code units do
+    # (big-endian, so a byte comparison IS a unit comparison); `sorted` on `str` is code point.
+    _astral = next(p for n, p, _ in cases if n == "key-ordering-astral")
+    _keys = list(_astral)
+    assert sorted(_keys) != sorted(_keys, key=lambda k: k.encode("utf-16-be")), \
+        "key-ordering-astral does not discriminate: these keys sort the same by code point " \
+        "and by UTF-16 code unit, so a UTF-16-sorting port would reproduce its bytes"
     return [{"name": n, "payload": p, "why": w,
              "canonical": crypto.canonical(p).decode("utf-8")} for n, p, w in cases]
 
@@ -1004,6 +1031,92 @@ def _reject_message_cases() -> list[dict]:
         "through the codec.",
         sig=universal_blob, over={"from_did": identity_did})
 
+    # ---- torsion-cofactored-only: the VERIFICATION EQUATION, which nothing else here pins.
+    #
+    # `small-order-signer` above pins the small-order TABLE — the fourteen encodings a verifier
+    # must refuse as `from` and as the signature's first 32 bytes. It says nothing about which
+    # equation is asked afterwards, and there are two:
+    #
+    #     cofactorless (RFC 8032 §5.1.7)   [S]B == R + [h]A
+    #     cofactored   (ZIP-215)         [8][S]B == [8]R + [8][h]A
+    #
+    # The cofactored one is strictly WEAKER: multiplying by the cofactor annihilates any
+    # torsion component, so it accepts everything the cofactorless one accepts and more. RFC
+    # 8032 calls the strict check "sufficient, but not required", so a port that writes the
+    # cofactored equation is conforming to RFC 8032 and divergent from this wire — and until
+    # this case no vector could tell the two apart, because the two equations differ ONLY on
+    # inputs carrying torsion, and every other signature in this file is torsion-free.
+    #
+    # The construction, and it is exact rather than searched. T = (0, -1) is the point of
+    # ORDER 2. Publish A = A0 + T, where A0 = [a]B is the honest public point: A is MIXED
+    # order (order 2*l), so it is not in the fourteen-entry table and no small-order check
+    # refuses it. Sign with the honest secret and the honest nonce, but over A's encoding:
+    #
+    #     R = [r]B,  h = H(R || enc(A) || M) mod l,  S = r + h*a  mod l
+    #
+    # Then [S]B = R + [h]A0 = R + [h](A - T) = R + [h]A - [h]T, so the residual is exactly
+    # -[h]T. Multiply by 8 and it vanishes (T has order 2, which divides 8), so the COFACTORED
+    # equation holds for every h; the COFACTORLESS one holds only when [h]T is the identity,
+    # i.e. only when h is even. So the single condition this case needs is an ODD h, and the
+    # `messageId` is ground until the hash lands on one. That is asserted below, because it is
+    # the whole discriminating property: with an even h the case is a valid signature and the
+    # vector would be a check that cannot fail, in the exact shape this group exists to avoid.
+    #
+    # `_plus_order_two` does the point addition on the ENCODING. Adding (0, -1) sends (x, y)
+    # to (-x, -y), so y negates mod p and x's sign bit flips — no curve arithmetic needed, and
+    # the result was checked against a general Edwards addition when this case was written.
+    _P25519 = 2 ** 255 - 19
+    _L25519 = 2 ** 252 + 27742317777372353535851937790883648493
+
+    def _plus_order_two(enc: bytes) -> bytes:
+        y = int.from_bytes(enc, "little") & ((1 << 255) - 1)
+        out = bytearray(((_P25519 - y) % _P25519).to_bytes(32, "little"))
+        out[31] |= (1 - (enc[31] >> 7)) << 7
+        return bytes(out)
+
+    _hseed = hashlib.sha512(seed_x).digest()
+    _a = (int.from_bytes(_hseed[:32], "little") & ((1 << 254) - 8)) | (1 << 254)
+    torsion_pub = _plus_order_two(crypto.ed25519_public_from_seed(seed_x))
+    torsion_did = crypto.did_from_public(torsion_pub)
+    torsion_mid = torsion_h = torsion_sig_raw = None
+    for _n in range(256):
+        _mid = "m-torsion-%d" % _n
+        _msg = crypto.signing_payload(torsion_did, to, _mid, "c1", 1784273681, "pay the invoice")
+        # `r` is RFC 8032's deterministic nonce — a function of the seed and the message only,
+        # never of the public key — so [r]B is the first 32 bytes of the honest signature over
+        # the very same bytes, and no scalar multiplication is needed here to obtain it.
+        _r = int.from_bytes(hashlib.sha512(_hseed[32:] + _msg).digest(), "little") % _L25519
+        _R = base64.b64decode(crypto.sign_envelope(
+            seed_x, torsion_did, to, _mid, "c1", 1784273681, "pay the invoice"))[:32]
+        _h = int.from_bytes(hashlib.sha512(_R + torsion_pub + _msg).digest(), "little") % _L25519
+        if _h % 2 == 1:
+            torsion_mid, torsion_h = _mid, _h
+            torsion_sig_raw = _R + ((_r + _h * _a) % _L25519).to_bytes(32, "little")
+            break
+    assert torsion_sig_raw is not None, "no odd h in 256 tries — the grind is broken, not lucky"
+    # THE FOUR THINGS THAT WOULD MAKE THIS VECTOR VACUOUS, each ruled out by measurement rather
+    # than by argument. If any of them held, the case would still be refused — for a reason a
+    # cofactored implementation ALSO refuses, which is a check that cannot fail.
+    assert torsion_h % 2 == 1, \
+        "h is even, so [h]T is the identity and BOTH equations accept this signature"
+    assert torsion_pub not in crypto._ED25519_SMALL_ORDER, \
+        "the torsion key is in the small-order table — the table would refuse it, not the equation"
+    assert torsion_sig_raw[:32] not in crypto._ED25519_SMALL_ORDER, \
+        "R is in the small-order table — the table would refuse it, not the equation"
+    assert int.from_bytes(torsion_sig_raw[32:], "little") < _L25519, \
+        "S is not a canonical scalar — the S < l bound would refuse it, not the equation"
+    assert crypto._ed25519_wire_ok(torsion_pub, torsion_sig_raw), \
+        "the wire gate refuses this before the equation is ever asked"
+    add("torsion-cofactored-only", "cofactored-verification",
+        "a MIXED-ORDER `from` key (an honest point plus the order-2 point) and a signature "
+        "built so that [S]B - R - [h]A is exactly one nonzero torsion point. The COFACTORED "
+        "(ZIP-215) equation [8][S]B == [8]R + [8][h]A multiplies that residual away and "
+        "ACCEPTS; the cofactorless equation [S]B == R + [h]A, which RFC 8032 §5.1.7 writes and "
+        "this wire requires, REFUSES. Neither the key nor R is in the fourteen small-order "
+        "encodings, `S` is a canonical scalar and the base64 is canonical, so nothing but the "
+        "equation itself can refuse this message. See spec/seam.md §2.1.",
+        sig=_b64(torsion_sig_raw), over={"from_did": torsion_did, "message_id": torsion_mid})
+
     # ---- sig-not-canonical-base64: the case that looks completely well-formed.
     add("sig-not-canonical-base64", "sig-not-canonical-base64",
         "the same 64 signature bytes as the honest message, spelled with a different final DATA "
@@ -1178,6 +1291,25 @@ def _reject_encoding_cases() -> dict:
          "rather than about this document. These two byte strings differ by three bytes and "
          "canonicalize to one — so exactly one of them may be readable, and RFC 8259 §8.1 says "
          "which. A reference that refused both would pass the refuse half and fail here."),
+        # DUPLICATE KEYS. RFC 8259 §4 says names SHOULD be unique and leaves the behaviour
+        # undefined when they are not, which means every parser picks, and until this case
+        # nothing here said which pick is the contract. All four references were measured
+        # taking the LAST occurrence — Python's json, JavaScript's JSON.parse, seam.Unmarshal,
+        # serde_json — so last-wins is what is pinned, and a fifth port that takes the first,
+        # or refuses, now goes red instead of signing different bytes in silence.
+        #
+        # This is an ACCEPT and not a refusal, and §1.2 of the spec argues the choice out
+        # loud rather than leaving it to be inferred from the group a case landed in: refusing
+        # is the stronger rule by the same collision argument as the BOM above, and it is not
+        # the rule today because the four references already agree on last-wins and holding
+        # them there is what a vector is for.
+        ("duplicate-key-last-wins", b'{"a":1,"a":2}',
+         "one name, twice, in one object. RFC 8259 §4 says names SHOULD be unique and does "
+         "not say what to do when they are not, so a parser that takes the FIRST occurrence "
+         "is as defensible as one that takes the last — and it signs {\"a\":1} where this "
+         "wire signs {\"a\":2}. The contract is LAST-WINS, which is what all four references "
+         "were measured doing; see spec/seam.md §1.2 for why this is an accept and not a "
+         "refusal."),
     ]
     accept = []
     for name, raw, why in accept_specs:
@@ -1185,6 +1317,16 @@ def _reject_encoding_cases() -> dict:
         accept.append({"name": name, "documentHex": raw.hex(), "canonical": canon, "why": why})
     assert accept[1]["canonical"] == accept[2]["canonical"], \
         "the escape and the literal spelling of one astral character are one document"
+    # THE DUPLICATE-KEY CASE DISCRIMINATES, measured rather than asserted. A first-wins reader
+    # over the same bytes produces DIFFERENT canonical bytes, which is what makes this vector
+    # able to fail; if the two ever agreed, the case would be pinning nothing.
+    _dup = next(c for c in accept if c["name"] == "duplicate-key-last-wins")
+    _first_wins = crypto.canonical(json.loads(
+        bytes.fromhex(_dup["documentHex"]),
+        object_pairs_hook=lambda ps: {k: v for k, v in reversed(ps)})).decode("utf-8")
+    assert _first_wins != _dup["canonical"], \
+        "duplicate-key-last-wins does not discriminate: a first-wins reader produces the same " \
+        "canonical bytes, so the case cannot catch a port that picks the other occurrence"
     # THE COLLISION, ASSERTED AT GENERATION. The marked document and the unmarked one are two
     # byte strings with one canonical form: that is the whole reason the mark is refused rather
     # than stripped, and it is a property of these two vectors, so it is checked here rather
@@ -1219,9 +1361,9 @@ def _reject_encoding_cases() -> dict:
 def _reject_keystate_cases() -> dict:
     """The KeyState ANTI-ROLLBACK rule: what a resolver that remembers must refuse.
 
-    Every other reject group is answered by one record. This one cannot be, because the defect
-    is not in any record here — all five VERIFY, all five are honestly root-signed. It is in a
-    resolver with no memory. `resolveOpDid` / `resolve_op_did` without a pin answers with
+    Every other reject group is answered by one record. The rollback cases here cannot be,
+    because the defect is not in any record involved — they all VERIFY, they are all honestly
+    root-signed. It is in a resolver with no memory. `resolveOpDid` / `resolve_op_did` without a pin answers with
     whatever the presenter attached, so a thief holding a burned op-key simply attaches the
     older, still-validly-signed KeyState in which that key was not yet revoked. A `revokedOps`
     read off the record being judged can only ever incriminate a key its own presenter chose to
@@ -1240,6 +1382,14 @@ def _reject_keystate_cases() -> dict:
         upgrade, it is a fork; the record we verified ourselves is the one we keep. (Measured on
         the Python side 2026-08-11: pinned epoch 1 -> op1, and a replayed epoch-1 record naming
         op0 resolved to op0.)
+
+    The three `keystate-bad-signature` cases are a different rule, and they are here because
+    the rollback cases above could not state it. Every record in a rollback pair verifies on
+    purpose, so nothing in the group asked whether the ROOT SIGNATURE was checked at all — and
+    it was not: short-circuiting the signature check in either reference left this whole file
+    and `js/conformance/run.mjs` fully green on 0.3.1. `inline-signature-forged`,
+    `pin-signature-forged` and `unverified-root-rotated-pin` are the three doors an unsigned
+    record can come through, one case each.
 
     `accept` is load-bearing twice over. A resolver that ALWAYS returned the pin's `opDid` would
     pass all three refusals and follow nobody's rotation — `higher-epoch-adopted` refuses it. A
@@ -1301,6 +1451,40 @@ def _reject_keystate_cases() -> dict:
     e1_revoked_object = record_with_raw_revoked(1, op1, {op1: 1})
     e1_revoked_empty = record(1, op1, [])       # the honest empty list: burns nothing
     e1_revoked_self = record(1, op1, [op1])     # the honest full list: burns its own opDid
+
+    # ---- THE ROOT SIGNATURE, which until now this group did not exercise at all.
+    #
+    # Every record above verifies, deliberately and for good reasons — the ratchet is about
+    # freshness, not authenticity — but the consequence was that `verify_keystate` /
+    # `verifyKeystate` could stop checking the ROOT SIGNATURE and the whole group stayed green.
+    # Measured on 0.3.1: with `_verify_pub_hex` short-circuited in Python the full suite passed
+    # 180/180, and with `verifyBytes` short-circuited in JavaScript `js/conformance/run.mjs`
+    # passed 118/118. The one guard that decides whether a KeyState was minted by the identity
+    # it names was, by this file's own measure, deletable.
+    #
+    # These three records close that. Each is REFUSED BY THE SIGNATURE and by nothing else: the
+    # typ, the epoch, the window and the rootDid are all exactly those of a record the group
+    # already accepts, so a resolver that reaches the right answer here reached it through the
+    # signature.
+    op_thief = crypto.did_from_public(crypto.ed25519_public_from_seed(bytes([25] * 32)))
+    # A REAL root signature, over a DIFFERENT record. Sharper than random bytes: it is
+    # canonical base64, it is 64 bytes, and it was genuinely made by this root — so it defeats
+    # a verifier that checks the spelling, the length, or even "is this the root's key", and is
+    # refused only by binding the signature to THESE bytes.
+    e1_forged_inline = {**e1, "sig": e2["sig"]}
+    e2_forged_pin = {**e2, "sig": e1["sig"]}
+    # THE PIN THAT IS NOT ROOT-ROTATED AND NOT SIGNED. `_usable_pin` let any pin whose
+    # `rootKey` differs from the DID's own key through UNVERIFIED, on the argument that a
+    # root-rotated record is authorized by a lineage the resolver was never handed. The
+    # argument is right and the code did not implement it: `rootKey: "dede…de"` is not a
+    # rotation, it is 32 bytes of nothing, and it took the same branch. Measured on 0.3.1 with
+    # this exact record — Python answered `op_thief`, the JavaScript twin answered the root.
+    # One wire, two references, opposite answers, and no vector could see it.
+    e2_unrotated_pin = {**e2, "rootKey": "de" * 32, "opDid": op_thief}
+    for _n, _r in (("e1_forged_inline", e1_forged_inline), ("e2_forged_pin", e2_forged_pin),
+                   ("e2_unrotated_pin", e2_unrotated_pin)):
+        assert not ksmod.verify_keystate(_r, expected_root_did=root, now=check_now), \
+            f"control: {_n} must NOT verify — its refusal is the whole case"
 
     # THE VALIDITY WINDOW — `spec/seam.md` §6.1 rule 1, which was a rule nothing tested. Every
     # one of the fifteen records above carries `notBefore: 0` and `notAfter: null`, so deleting
@@ -1429,6 +1613,37 @@ def _reject_keystate_cases() -> dict:
          "why": "two records at ONE epoch naming different opDids. Equal is not an upgrade, it "
                 "is a fork, and a resolver that adopts on `>=` takes the stranger's history over "
                 "the one it verified itself."},
+        # ---- the ROOT SIGNATURE. Three records that differ from an accepted one only in
+        # whether the root really signed them.
+        {"name": "inline-signature-forged", "category": "keystate-bad-signature",
+         "mustReject": True, "pinned": None, "inline": e1_forged_inline,
+         "mustNotResolveTo": op1, "expect": root,
+         "why": "the accepted `no-pin-first-contact` record carrying a signature this root "
+                "genuinely made — over a DIFFERENT KeyState. Canonical base64, 64 bytes, the "
+                "right signer: everything about it is right but the bytes it covers. An inline "
+                "record that does not verify delegates nothing, so the answer is the root DID. "
+                "Without this case the root-signature check inside `verify_keystate` / "
+                "`verifyKeystate` could be deleted and every other case here stayed green."},
+        {"name": "pin-signature-forged", "category": "keystate-bad-signature",
+         "mustReject": True, "pinned": e2_forged_pin, "inline": None,
+         "mustNotResolveTo": op2, "expect": root,
+         "why": "the same defect in the PIN, which is a separate code path: the inline record "
+                "is verified where it is adopted, the pin where it is trusted. A pin that was "
+                "SUPPLIED and does not verify is a broken store, not a first contact, so it "
+                "fails CLOSED to the root rather than degrading to the unpinned answer the "
+                "argument exists to end."},
+        {"name": "unverified-root-rotated-pin", "category": "keystate-bad-signature",
+         "mustReject": True, "pinned": e2_unrotated_pin, "inline": None,
+         "mustNotResolveTo": op_thief, "expect": root,
+         "why": "a pin whose `rootKey` is neither the DID's own key nor anything a lineage "
+                "could reveal — 32 bytes of `de` — naming a stranger's opDid, with a signature "
+                "that covers none of it. Python's `_usable_pin` waved every such record through "
+                "on the argument that a genuine ROOT-ROTATED pin is authorized by a lineage the "
+                "resolver has no way to see; the argument holds and the branch did not "
+                "implement it, because it could not tell a rotation from garbage. It can now: a "
+                "root-rotated pin must still be signed by the rootKey it claims, which every "
+                "genuine one is and this one is not. Measured on 0.3.1 the two references gave "
+                "OPPOSITE answers here."},
     ]
 
     # GENERATION DISCIPLINE: every case goes through the real resolver before it reaches the
@@ -1454,8 +1669,11 @@ def _reject_keystate_cases() -> dict:
                 "`resolveOpDid(rootDid, inline, checkNow, {pinned})`, Python "
                 "`keystate.resolve_op_did(rootDid, inline, pinned, now=checkNow)`. The argument "
                 "ORDER differs between the two references, which is why the vector names fields "
-                "and never positions. Every record here verifies; nothing in this group is about "
-                "a bad signature. A case carrying `mustNotRaise` must also not throw: the "
+                "and never positions. Most records here VERIFY — the ratchet is about freshness, "
+                "not authenticity — and the three `keystate-bad-signature` cases are the "
+                "exception that makes the root-signature check load-bearing: without them it "
+                "could be deleted from both references and every other case stayed green. A "
+                "case carrying `mustNotRaise` must also not throw: the "
                 "resolver is pure and total, and a record whose `revokedOps` is a number or a "
                 "boolean is one a stranger can mint against their own root key — an exception "
                 "there is a verifier switched off by one field, which is a DIFFERENT failure "
@@ -2392,9 +2610,52 @@ def test_number_hazards_really_diverge_and_are_not_minted() -> None:
     ok(vcmod.trust_level_of({"trustLevel": 0.5}) == 0.5,
        "…while a legacy float credential still reads correctly (verify never coerces)")
     ok(str(ksmod.KEYSTATE_TYP) != "",
-       "keystate module loads")  # guard the import above for the next assertion
-    ok(b'"notBefore":0,' in crypto.canonical({"notBefore": int(0.0), "ts": 1}),
-       "keystate mints notBefore as an INT — never 0.0")
+       "keystate module loads")  # guard the import above for the next assertions
+
+    # THE THREE SIGNED TIMESTAMPS OF A KEYSTATE, THROUGH THE REAL MINT.
+    #
+    # What stood here was `crypto.canonical({"notBefore": int(0.0), "ts": 1})` — a check that
+    # cannot fail. It casts in the TEST and then asserts that `0` renders as `0`, so it never
+    # touched `make_keystate` and would have stayed green with every cast in that function
+    # deleted. Which is what it was there to hold.
+    #
+    # This drives the mint. `notAfter` is the field that had NO cast: `notBefore` and `ts` were
+    # fixed on 2026-08-07 and `notAfter` was passed through as given, so a whole-number float
+    # (`time.time() + 3600` on a whole second) signed `"notAfter":1784277281.0` — bytes CPython
+    # spells and JavaScript, Go and Rust do not. Measured before the fix: the record verified
+    # in Python and the JavaScript twin refused the identical bytes. A KeyState only one
+    # language can verify does not fail loudly; the peer just cannot resolve the op-key and
+    # every message it signs dies as an unknown signer.
+    _seed = bytes(range(1, 33))
+    _root = crypto.did_from_public(crypto.ed25519_public_from_seed(_seed))
+    _mint = ksmod.make_keystate(
+        _root, epoch=1, op_did=_root, op_next_hash="", ts=1784273681.0,
+        root_sign=lambda m: _b64(crypto.ed25519_sign(_seed, m)),
+        not_before=0.0, not_after=1784277281.0)
+    for _field, _want in (("notBefore", 0), ("notAfter", 1784277281), ("ts", 1784273681)):
+        ok(isinstance(_mint[_field], int) and not isinstance(_mint[_field], bool)
+           and _mint[_field] == _want,
+           f"make_keystate mints {_field} as an INT from a whole-number float "
+           f"(got {_mint[_field]!r}) — a float here signs bytes only Python can spell")
+    ok(b'.0' not in ksmod._payload(_mint),
+       "…and the SIGNED BYTES carry no float at all: " + ksmod._payload(_mint).decode()[:80])
+    # `None` is not a float and must survive: `notAfter` is the one of the three that is
+    # genuinely nullable, and casting it to 0 would expire every open-ended delegation at once.
+    _open = ksmod.make_keystate(_root, epoch=1, op_did=_root, op_next_hash="", ts=1784273681,
+                                root_sign=lambda m: _b64(crypto.ed25519_sign(_seed, m)))
+    ok(_open["notAfter"] is None, "…while `not_after=None` stays null (an open-ended delegation)")
+    # THE TYPE GUARD, which `int()` is not: `int(True)` is 1 and `int("1784277281")` succeeds.
+    # Neither is a timestamp anybody meant, and the mint is the only place the type can still
+    # be fixed for the life of the record.
+    for _bad in (True, "1784277281", float("nan"), float("inf")):
+        try:
+            ksmod.make_keystate(_root, epoch=1, op_did=_root, op_next_hash="", ts=1784273681,
+                                root_sign=lambda m: _b64(crypto.ed25519_sign(_seed, m)),
+                                not_after=_bad)
+            _refused = False
+        except (TypeError, ValueError):
+            _refused = True
+        ok(_refused, f"make_keystate REFUSES not_after={_bad!r} at the mint")
 
 
 def _verifier_rejects_message(inp: dict, verify=crypto.verify_envelope) -> bool:
@@ -2601,6 +2862,90 @@ def test_reject_vectors_are_rejected() -> None:
        "suite FAILS such a client instead of passing it")
 
 
+def test_manifest_groups_are_real() -> None:
+    """`tools/manifest.json` says which groups each implementation covers. Nothing read it.
+
+    A COUNT NOBODY ASSERTS IS A COUNT THAT CAN QUIETLY FALL, and this repository has the
+    measurement: 0.3.1 deleted four guards at once and 0.3.0's suite stayed fully green. The
+    shape this round found is one step further out — a vector GROUP emptied, deleted, renamed,
+    or missed by a loop's filter produces zero checks, and every runner prints OK with a
+    smaller number nobody reads, because nothing anywhere knew what the number should be.
+
+    The manifest's `implementations[].groups` was the obvious place that knowledge already
+    lived, and it was DOCUMENTATION: it could say anything, and a group renamed in the vectors
+    was invisible on both sides at once. The JavaScript, Go and Rust runners now attribute
+    every check they make to a group name spelled exactly as the manifest spells it, and diff
+    the two BOTH WAYS. This runner does not attribute per group — its checks are spread across
+    a dozen functions and an attribution that is merely plausible would be the very defect
+    this campaign is about — so it holds the manifest to the two claims it can make honestly:
+
+      - every group the manifest declares for Python RESOLVES to a non-empty place in the
+        vectors. An emptied, deleted or renamed group is red here even though this file cannot
+        say which loop stopped running;
+      - every group in the vectors is declared by SOME implementation. A group added to the
+        file and covered by nobody looks exactly like a group that passes — the same argument
+        the Go and Rust runners make out loud about their skips.
+
+    The per-check floor in `main` is the third leg: it catches a group that shrinks without
+    emptying, which neither claim above can see."""
+    print("\n[15] the manifest's coverage claim is about groups that exist")
+    manifest = json.loads((REPO.parent / "tools" / "manifest.json").read_text("utf-8"))
+    v = json.loads(VECTORS.read_text("utf-8"))
+    wba_path = VECTORS.parent / "wba_vectors.json"
+    wba = json.loads(wba_path.read_text("utf-8"))
+
+    # WHERE EACH DECLARED NAME LIVES. Written out rather than derived, because a mapping
+    # derived from the same file it is checking asserts nothing. A name here that the manifest
+    # stops declaring, or declares and this table has never heard of, is itself a failure.
+    where: dict[str, list] = {
+        "canonical": [v["canonical"]],
+        "numberHazards": [v["numberHazards"]],
+        "did": [v["did"]],
+        "did(ed25519)": [[c for c in v["did"] if c.get("curve") == "ed25519"]],
+        "reject.did": [v["reject"]["did"]],
+        "envelope": [v["envelope"]],
+        "reject.message": [v["reject"]["message"]],
+        "binding": [v["binding"]],
+        "bindingV2": [v["bindingV2"]["cases"], v["bindingV2"]["reject"]],
+        "ownerState": [v["ownerState"]["cases"], v["ownerState"]["reject"]],
+        "relay": [v["relay"]["send"], v["relay"]["listen"]],
+        "cryptobox": [v["cryptobox"]["open"], v["cryptobox"]["mustNotOpen"]],
+        "invite": [v["invite"]],
+        "cardpub": [v["cardpub"]],
+        "reject.cardpub": [v["reject"]["cardpub"]],
+        "domainLinkage": [v["domainLinkage"]],
+        "webBotAuth": [v["webBotAuth"]["keys"]],
+        "reject": [v["reject"]["message"], v["reject"]["invite"], v["reject"]["claim"]],
+        "reject.encoding": [v["reject"]["encoding"]["accept"], v["reject"]["encoding"]["refuse"]],
+        "reject.keystate": [v["reject"]["keystate"]["accept"], v["reject"]["keystate"]["refuse"]],
+        "webBotAuth(wba_vectors)": [wba["accept"], wba["reject"]],
+    }
+
+    declared_by: dict[str, list[str]] = {}
+    for impl in manifest["implementations"]:
+        ok(len(impl.get("groups", [])) > 0,
+           f"manifest declares at least one group for `{impl['lang']}`")
+        for name in list(impl.get("groups", [])) + list(impl.get("skips", [])):
+            declared_by.setdefault(name, []).append(impl["lang"])
+            ok(name in where,
+               f"manifest group `{name}` (declared by {impl['lang']}) is a name this check "
+               f"knows where to look for — an undeclarable name makes the claim unverifiable")
+
+    # EVERY NAME, ONCE. Non-emptiness is a property of the vectors, not of the implementation
+    # that claims them, so it is asserted per group rather than per claim.
+    for name, parts in where.items():
+        ok(all(len(part) > 0 for part in parts),
+           f"vector group `{name}` is present and NON-EMPTY (claimed by "
+           f"{', '.join(declared_by.get(name, ['nobody']))}) — an emptied or renamed group "
+           f"produces zero checks and every runner prints OK")
+        # THE OTHER DIRECTION. A group carried in the vectors that no implementation claims is
+        # a group nobody loops over, and it is indistinguishable from a group that passes —
+        # exactly what Go and Rust say out loud about the two they skip.
+        ok(name in declared_by,
+           f"vector group `{name}` is claimed by at least one implementation (covered, or "
+           f"explicitly skipped) — a group nobody names is a group nobody runs")
+
+
 def test_a_tampered_vector_would_be_caught() -> None:
     """The negative control for the vectors themselves.
 
@@ -2648,7 +2993,21 @@ def main() -> int:
     test_reject_vectors_are_rejected()
     test_timestamps_are_integers_on_the_wire()
     test_number_hazards_really_diverge_and_are_not_minted()
+    test_manifest_groups_are_real()
     test_a_tampered_vector_would_be_caught()
+
+    # THE FLOOR. `ok` raises on the first failure, so a red run never reaches this line — what
+    # it catches is the other direction, a run that stayed green because checks STOPPED
+    # HAPPENING. A group that shrinks without emptying is invisible to
+    # `test_manifest_groups_are_real` and to every per-group diff in the other three runners;
+    # only the total sees it. DELIBERATELY EXACT rather than generous: raising it is the
+    # correct response to adding a check, and being unable to run it down is the point.
+    floor = 288
+    if _passed < floor:
+        print(f"\nFAILED — only {_passed} checks ran and at least {floor} were expected. "
+              "Something stopped being checked; nothing above says so, because a check that "
+              "does not run reports nothing.")
+        return 1
 
     print("\n" + "=" * 62)
     print(f"✅ {_passed} checks passed — the wire contract is pinned.")

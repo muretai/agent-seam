@@ -34,8 +34,67 @@ impl Report {
     }
 }
 
+/// WHICH GROUP PRODUCED WHICH CHECKS. `close` ends a section: it attributes every check counted
+/// since the previous call to `name`, which is a group name spelled EXACTLY as
+/// `tools/manifest.json` spells it for this language. The verdict then diffs the two.
+///
+/// Attribution by delta rather than by wrapping each `check` keeps the loops below unchanged and
+/// works because the sections are contiguous; a group whose loop ran zero times closes with a
+/// delta of zero, which is precisely the case this exists to catch.
+struct Groups {
+    drove: Vec<(String, usize)>,
+    mark: usize,
+}
+
+impl Groups {
+    fn close(&mut self, r: &Report, name: &str) {
+        let total = r.pass + r.failures.len();
+        self.drove.push((name.to_string(), total - self.mark));
+        self.mark = total;
+    }
+    fn count(&self, name: &str) -> usize {
+        self.drove
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, c)| c)
+            .sum()
+    }
+}
+
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// A JSON array of strings, or an empty vector.
+fn strings_of(v: &Value, k: &str) -> Vec<String> {
+    v.get(k)
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Locate `tools/manifest.json` the way `find_vectors` locates the vectors. A missing manifest
+/// is fatal rather than skipped: the point of reading it is that the coverage claim cannot be
+/// quietly absent.
+fn find_manifest() -> (String, String) {
+    for p in [
+        "../tools/manifest.json",
+        "../../tools/manifest.json",
+        "tools/manifest.json",
+    ] {
+        if let Ok(t) = std::fs::read_to_string(p) {
+            let abs = std::fs::canonicalize(p)
+                .map(|a| a.display().to_string())
+                .unwrap_or_else(|_| p.to_string());
+            return (abs, t);
+        }
+    }
+    eprintln!("error: tools/manifest.json not found — run this from the rust/ directory");
+    exit(2);
 }
 
 /// Hex to bytes, or None. `reject.encoding` carries whole documents this way because a raw
@@ -94,6 +153,10 @@ fn main() {
         pass: 0,
         failures: vec![],
     };
+    let mut g = Groups {
+        drove: vec![],
+        mark: 0,
+    };
 
     // ---- canonical: the bytes, case by case
     for c in v["canonical"].as_array().unwrap_or(&vec![]) {
@@ -112,6 +175,7 @@ fn main() {
             ),
         }
     }
+    g.close(&r, "canonical");
 
     // ---- numberHazards: values a signer must never emit. The JavaScript runner counts these
     // and leaves them; here, as in Go, they are executed, because a Rust encoder that quietly
@@ -127,6 +191,7 @@ fn main() {
             ),
         );
     }
+    g.close(&r, "numberHazards");
 
     // ---- did:key, both directions
     let mut ed = 0;
@@ -153,6 +218,7 @@ fn main() {
             &format!("got {back_hex}, want {hex}"),
         );
     }
+    g.close(&r, "did(ed25519)");
 
     // ---- reject.did: the other direction of the codec above.
     //
@@ -181,6 +247,7 @@ fn main() {
             &format!("DECODED a did:key it must refuse — {}", s(c, "why")),
         );
     }
+    g.close(&r, "reject.did");
 
     // ---- the signing envelope: the exact bytes that are signed
     for c in v["envelope"].as_array().unwrap_or(&vec![]) {
@@ -212,6 +279,7 @@ fn main() {
         "envelope/round-trip",
         "this build cannot verify what it just signed",
     );
+    g.close(&r, "envelope");
 
     // ---- the refusals
     for c in v["reject"]["message"].as_array().unwrap_or(&vec![]) {
@@ -248,6 +316,7 @@ fn main() {
             &format!("ACCEPTED a message it must refuse — {}", s(c, "note")),
         );
     }
+    g.close(&r, "reject.message");
 
     // ---- the encoding boundary: raw document BYTES, not a value
     //
@@ -303,6 +372,7 @@ fn main() {
             &format!("ACCEPTED bytes it must refuse — {}", s(c, "why")),
         );
     }
+    g.close(&r, "reject.encoding");
 
     // ---- reject.keystate: SKIPPED HERE, AND SAID SO.
     //
@@ -342,6 +412,110 @@ fn main() {
         "reject.cardpub is missing or empty — this runner skips the group ON PURPOSE and \
          cannot skip a group that is not there",
     );
+
+    // ---- what the manifest declares this implementation covers.
+    //
+    // A COUNT NOBODY ASSERTS IS A COUNT THAT CAN QUIETLY FALL, and this repository has the
+    // measurement: 0.3.1 deleted four guards at once and 0.3.0's suite stayed fully green. A
+    // bare floor would not have caught this round's finding either — an emptied, renamed or
+    // filter-missed vector group produces zero checks and this file prints OK with a smaller
+    // number nobody reads, because nothing here ever knew what the number should be.
+    //
+    // `tools/manifest.json` has always listed, per implementation, the groups it covers and the
+    // groups it deliberately skips. NOTHING READ IT. It was documentation, so it could say
+    // anything, and a group renamed in the vectors and missed by a loop was invisible on both
+    // sides at once. It is the assertion now, and the diff runs BOTH WAYS: every declared group
+    // must have produced a check (an emptied or missed group), and every group driven must be
+    // declared (a group RENAMED, which the one-way check goes green on the moment the runner
+    // and the vectors agree on a name the manifest never heard of).
+    //
+    // The skips are held to the same standard from the other side: a group this runner asserts
+    // it is skipping must be listed as a skip, and must not also be listed as covered.
+    let (mpath, mraw) = find_manifest();
+    let man: Value = match serde_json::from_str(&mraw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: tools/manifest.json is not readable: {e}");
+            exit(2);
+        }
+    };
+    let mine = man["implementations"]
+        .as_array()
+        .and_then(|a| a.iter().find(|m| s(m, "lang") == "rust"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    r.check(
+        !mine.is_null(),
+        "manifest/rust-is-an-implementation",
+        &format!("tools/manifest.json ({mpath}) has no entry with lang \"rust\""),
+    );
+    let declared = strings_of(&mine, "groups");
+    let skips = strings_of(&mine, "skips");
+    r.check(
+        !declared.is_empty(),
+        "manifest/rust-declares-its-groups",
+        "the manifest lists no `groups` for rust — this whole section then asserts nothing",
+    );
+    for name in &declared {
+        let n = g.count(name);
+        r.check(
+            n > 0,
+            &format!("manifest/group-drove-checks/{name}"),
+            &format!(
+                "tools/manifest.json declares `{name}` for rust and this run produced {n} checks \
+                 from it. An emptied, renamed or filter-missed vector group prints OK; this is \
+                 what stops it."
+            ),
+        );
+    }
+    let driven: Vec<String> = g.drove.iter().map(|(n, _)| n.clone()).collect();
+    for name in &driven {
+        r.check(
+            declared.contains(name),
+            &format!("manifest/group-is-declared/{name}"),
+            &format!(
+                "this runner drove `{name}` and the manifest does not declare it for rust — \
+                 either the manifest is stale or the group was renamed on one side only"
+            ),
+        );
+    }
+    // The two groups asserted-and-skipped above must be exactly the two the manifest calls
+    // skips, and a group cannot be both covered and skipped.
+    for name in ["reject.keystate", "reject.cardpub"] {
+        r.check(
+            skips.iter().any(|x| x == name),
+            &format!("manifest/skip-is-declared/{name}"),
+            &format!(
+                "this runner skips `{name}` by name and the manifest does not list it under \
+                 `skips`"
+            ),
+        );
+    }
+    for name in &skips {
+        r.check(
+            !declared.contains(name),
+            &format!("manifest/skip-is-not-also-covered/{name}"),
+            &format!("the manifest lists `{name}` as both covered and skipped for rust"),
+        );
+        r.check(
+            g.count(name) == 0,
+            &format!("manifest/skipped-group-drove-nothing/{name}"),
+            &format!("the manifest calls `{name}` a skip and this runner attributed checks to it"),
+        );
+    }
+
+    // The absolute floor, DELIBERATELY EXACT rather than generous. Raising it is the correct
+    // response to adding a check; being unable to run it down is the point. It catches a group
+    // that shrinks without emptying, which the diff above cannot see.
+    const FLOOR: usize = 88;
+    if r.pass + r.failures.len() < FLOOR {
+        let ran = r.pass + r.failures.len();
+        r.failures.push(format!(
+            "suite/check-count-floor\n      only {ran} checks ran and at least {FLOOR} were \
+             expected. Something stopped being checked; the rows above will not say so, because \
+             a check that does not run reports nothing."
+        ));
+    }
 
     if !r.failures.is_empty() {
         println!(
