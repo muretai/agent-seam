@@ -163,6 +163,31 @@
         "reject.cardpub"
       ],
       "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT and non-empty in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState and no card envelope in this reference to hold to either."
+    },
+    {
+      "lang": "php",
+      "dir": "php",
+      "run": "php php/conformance.php",
+      "groups": [
+        "canonical",
+        "numberHazards",
+        "did",
+        "reject.did",
+        "envelope",
+        "reject.message",
+        "cardpub",
+        "reject.cardpub",
+        "bindingV2",
+        "reject.claim"
+      ],
+      "skips": [
+        "reject.encoding",
+        "reject.keystate",
+        "cryptobox",
+        "webBotAuth"
+      ],
+      "_skips": "Groups this implementation deliberately does NOT check. Its runner asserts each is PRESENT and non-empty in the vectors and prints the skip by name, so the omission is visible: a group nobody loops over is carried in the file, checked by nobody, and indistinguishable from a group that passes. There is no KeyState and no card envelope in this reference to hold to either.",
+      "_home": "The WordPress plugin (agent-entry-wordpress) VENDORS this directory and adds its own ABSPATH guard as a recorded transform. It is the home; the plugin is a consumer. It lived in the plugin until 2026-09-09, which meant the seam's own suite never ran PHP — so when the JavaScript reference was found accepting a small-order signature on Node 22, whether PHP was exposed was a question about another repository."
     }
   ]
 }

@@ -1,7 +1,7 @@
 {
   "name": "@muretai/agent-seam",
-  "version": "0.3.3",
-  "description": "The byte contract two programs that have never met authenticate each other with: canonical JSON, did:key, the six signed fields, the signed Agent Card envelope, device-key binding, Web Bot Auth verify, cryptobox. Golden vectors plus four independent reference implementations \u2014 JavaScript, Python, Go, Rust. Zero dependencies in three of them. MIT.",
+  "version": "0.3.4",
+  "description": "The byte contract two programs that have never met authenticate each other with: canonical JSON, did:key, the six signed fields, the signed Agent Card envelope, device-key binding, Web Bot Auth verify, cryptobox. Golden vectors plus five independent reference implementations \u2014 JavaScript, Python, Go, Rust, PHP. Zero dependencies in four of them. MIT.",
   "type": "module",
   "license": "MIT",
   "author": "Muretai",
@@ -26,6 +26,7 @@
   },
   "scripts": {
     "test": "node tools/check-manifest.mjs && node js/conformance/run.mjs",
-    "test:py": "python3 python/test_closure.py && python3 python/test_wire_vectors.py && python3 python/test_webbotauth.py && python3 python/test_keybinding.py && python3 python/test_cryptobox.py && python3 python/test_gateway.py && python3 python/test_neturl_origin.py && python3 python/test_ed25519_backend_agreement.py"
+    "test:py": "python3 python/test_closure.py && python3 python/test_wire_vectors.py && python3 python/test_webbotauth.py && python3 python/test_keybinding.py && python3 python/test_cryptobox.py && python3 python/test_gateway.py && python3 python/test_neturl_origin.py && python3 python/test_ed25519_backend_agreement.py",
+    "test:php": "php php/conformance.php"
   }
 }

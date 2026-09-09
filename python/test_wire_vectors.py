@@ -1293,20 +1293,26 @@ def _reject_encoding_cases() -> dict:
          "which. A reference that refused both would pass the refuse half and fail here."),
         # DUPLICATE KEYS. RFC 8259 §4 says names SHOULD be unique and leaves the behaviour
         # undefined when they are not, which means every parser picks, and until this case
-        # nothing here said which pick is the contract. All four references were measured
+        # nothing here said which pick is the contract. All five references were measured
         # taking the LAST occurrence — Python's json, JavaScript's JSON.parse, seam.Unmarshal,
-        # serde_json — so last-wins is what is pinned, and a fifth port that takes the first,
-        # or refuses, now goes red instead of signing different bytes in silence.
+        # serde_json, PHP's json_decode — so last-wins is what is pinned, and a sixth port
+        # that takes the first, or refuses, now goes red instead of signing different bytes
+        # in silence.
         #
         # This is an ACCEPT and not a refusal, and §1.2 of the spec argues the choice out
         # loud rather than leaving it to be inferred from the group a case landed in: refusing
         # is the stronger rule by the same collision argument as the BOM above, and it is not
-        # the rule today because the four references already agree on last-wins and holding
+        # the rule today because the five references already agree on last-wins and holding
         # them there is what a vector is for.
         ("duplicate-key-last-wins", b'{"a":1,"a":2}',
          "one name, twice, in one object. RFC 8259 §4 says names SHOULD be unique and does "
          "not say what to do when they are not, so a parser that takes the FIRST occurrence "
          "is as defensible as one that takes the last — and it signs {\"a\":1} where this "
+         # "four" and not "five": this string is a `why` field INSIDE the digest-pinned
+         # vector file. PHP joined as the fifth reference in 0.3.4 and takes last-wins too
+         # (json_decode, measured), but rewording this costs a --regen and a re-vendor across
+         # eight repositories for a sentence. It is corrected at the next intentional vector
+         # change, when that cascade is happening anyway.
          "wire signs {\"a\":2}. The contract is LAST-WINS, which is what all four references "
          "were measured doing; see spec/seam.md §1.2 for why this is an accept and not a "
          "refusal."),
@@ -1884,7 +1890,7 @@ def _reject_did_cases() -> list[dict]:
     bytes. So the length rule above refuses every over-long DID in every implementation, with
     or without a cap, and a vector for it would be green in an implementation that has no cap
     at all — a check that cannot fail, which is the exact defect this release exists to close.
-    The cap is real and all four references now carry it (512 base58 characters); what it buys
+    The cap is real and all five references now carry it (512 base58 characters); what it buys
     is CPU, not a verdict, and cost is not something a byte vector can hold anyone to."""
     ed_pub = bytes(range(32))
     x25519_multicodec = b"\xec\x01"          # multicodec x25519-pub — 32-byte key, like ed25519
@@ -2061,6 +2067,8 @@ def build_vectors() -> dict:
                       "34 decoded bytes, each case shaped so ONE missing check fails it; there "
                       "is deliberately NO over-long case, because no over-long base58 decodes to "
                       "34 bytes and such a vector would be green in an implementation with no "
+                      # "four": a `why` field inside the pinned vectors — see the note at the
+                      # duplicate-key case. PHP carries the cap too (MAX_B58_LEN = 512).
                       "length cap at all (the cap is real, it is 512 in all four references, and "
                       "it buys CPU rather than a verdict — spec §2). cardpub: the card envelope "
                       "verifier, with `expectedDid` at the TOP LEVEL of the case because it is "
@@ -2916,6 +2924,10 @@ def test_manifest_groups_are_real() -> None:
         "domainLinkage": [v["domainLinkage"]],
         "webBotAuth": [v["webBotAuth"]["keys"]],
         "reject": [v["reject"]["message"], v["reject"]["invite"], v["reject"]["claim"]],
+        # The PHP reference walks the claim half by name without the invite half, so it
+        # declares `reject.claim` rather than the whole `reject`. A declared name with no
+        # row here fails, which is how this one was found the moment PHP was declared.
+        "reject.claim": [v["reject"]["claim"]],
         "reject.encoding": [v["reject"]["encoding"]["accept"], v["reject"]["encoding"]["refuse"]],
         "reject.keystate": [v["reject"]["keystate"]["accept"], v["reject"]["keystate"]["refuse"]],
         "webBotAuth(wba_vectors)": [wba["accept"], wba["reject"]],

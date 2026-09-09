@@ -1,7 +1,8 @@
 # agent-seam
 
 **The byte contract two programs that have never met authenticate each other with, as golden
-vectors plus reference implementations in JavaScript and Python. Zero dependencies. MIT.**
+vectors plus five independent reference implementations — JavaScript, Python, Go, Rust, PHP.
+Zero dependencies in four of them (PHP needs `sodium`). MIT.**
 
 Two programs that have never met can still prove who they are to each other, if they agree on
 bytes: canonical JSON, `did:key`, six signed fields, a signed Agent Card envelope, device-key
@@ -23,6 +24,8 @@ of them owns the contract.
 - [`js/seam.mjs`](js/seam.mjs) — the JavaScript reference, one file, `node:crypto` only
 - [`python/shared/`](python/shared/) — the Python reference, 18 modules, stdlib only
   (`cryptography` optional)
+- [`php/seam.php`](php/seam.php) — the PHP reference, one file, `sodium` only; the
+  WordPress plugin vendors it and adds its own `ABSPATH` guard
 - [`tools/manifest.json`](tools/manifest.json) — what this repository publishes and how a
   consumer cuts it; [`tools/check-manifest.mjs`](tools/check-manifest.mjs) keeps it exact
 
@@ -32,6 +35,7 @@ of them owns the contract.
 npm test               # manifest 17 · JS conformance 149
 cd go && go run ./conformance   # Go:     OK — 88 checks
 cd rust && cargo run --quiet --bin conformance   # Rust: OK — 88 checks
+php php/conformance.php         # PHP:    CONFORMANT — 121 passed
 npm run test:py        # Python: closure 220 · wire vectors 288 · web bot auth 5 accepted / 25 refused
                        #         · keybinding · cryptobox · gateway · neturl
                        #         · ed25519 backend agreement 316 (library vs pure-python)
@@ -73,24 +77,24 @@ Both diffs are empty: the Python reference is the generator of the bytes everyth
 
 ## Coverage
 
-| Vector group | JS (`js/conformance/run.mjs`) | Python (`python/test_wire_vectors.py`) | Go (`go/conformance`) | Rust (`rust/conformance`) |
-|---|---|---|---|---|
-| `canonical` | ✓ | ✓ | ✓ | ✓ |
-| `numberHazards` | read, not executed (a signer rule) | ✓ | ✓ executed as refusals | ✓ executed as refusals |
-| `did` | ✓ Ed25519, both directions | ✓ both curves | ✓ Ed25519, both directions | ✓ Ed25519, both directions |
-| `reject.did` | ✓ 3 | ✓ 3 + a base58 control | ✓ 3 | ✓ 3 |
-| `envelope` | ✓ + round trip | ✓ | ✓ + round trip | ✓ + round trip |
-| `reject.message` | ✓ | ✓ (+ `invite`, `claim`) | ✓ | ✓ |
-| `reject.encoding` | ✓ `canonicalFromJSON`, 4 accept + 9 refuse | ✓ `crypto.canonical_from_json` | ✓ `seam.CanonicalFromJSON` | ✓ `serde_json::from_slice` |
-| `reject.keystate` | ✓ `resolveOpDid(…, { pinned })`, 10 accept + 3 refuse | ✓ `keystate.resolve_op_did` | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name |
-| `cardpub` | ✓ payload + verify + anti-substitution | ✓ | — | — |
-| `reject.cardpub` | ✓ 3 | ✓ 3 + a fail-open meta-control | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name |
-| `bindingV2` | ✓ 2 accept + 4 reject, `expectedDeviceDid` from the case | ✓ same | — | — |
-| `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused | — | — |
-| `relay` | — | ✓ signatures, the `\|` join order, the origin binding | — | — |
-| `binding` (v1), `domainLinkage`, `invite` | — | ✓ | — | — |
-| Web Bot Auth (`wba_vectors.json`) | ✓ 5 + 25 | ✓ (`python/test_webbotauth.py`) | — | — |
-| `cryptobox` | ✓ `open` (with `ad`) + `mustNotOpen` + `encPub` | ✓ | — | — |
+| Vector group | JS (`js/conformance/run.mjs`) | Python (`python/test_wire_vectors.py`) | Go (`go/conformance`) | Rust (`rust/conformance`) | PHP (`php/conformance.php`) |
+|---|---|---|---|---|---|
+| `canonical` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `numberHazards` | read, not executed (a signer rule) | ✓ | ✓ executed as refusals | ✓ executed as refusals | ✓ executed as refusals |
+| `did` | ✓ Ed25519, both directions | ✓ both curves | ✓ Ed25519, both directions | ✓ Ed25519, both directions | ✓ both curves |
+| `reject.did` | ✓ 3 | ✓ 3 + a base58 control | ✓ 3 | ✓ 3 | ✓ 3 |
+| `envelope` | ✓ + round trip | ✓ | ✓ + round trip | ✓ + round trip | ✓ + round trip |
+| `reject.message` | ✓ | ✓ (+ `invite`, `claim`) | ✓ | ✓ | ✓ (+ `claim`) |
+| `reject.encoding` | ✓ `canonicalFromJSON`, 4 accept + 9 refuse | ✓ `crypto.canonical_from_json` | ✓ `seam.CanonicalFromJSON` | ✓ `serde_json::from_slice` | skipped, and the skip is asserted by name |
+| `reject.keystate` | ✓ `resolveOpDid(…, { pinned })`, 10 accept + 3 refuse | ✓ `keystate.resolve_op_did` | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name |
+| `cardpub` | ✓ payload + verify + anti-substitution | ✓ | — | — | ✓ |
+| `reject.cardpub` | ✓ 3 | ✓ 3 + a fail-open meta-control | skipped, and the skip is asserted by name | skipped, and the skip is asserted by name | ✓ 3 |
+| `bindingV2` | ✓ 2 accept + 4 reject, `expectedDeviceDid` from the case | ✓ same | — | — | ✓ same |
+| `ownerState` | — | ✓ 2 accepted + anti-substitution + 5 refused | — | — | — |
+| `relay` | — | ✓ signatures, the `\|` join order, the origin binding | — | — | — |
+| `binding` (v1), `domainLinkage`, `invite` | — | ✓ | — | — | — |
+| Web Bot Auth (`wba_vectors.json`) | ✓ 5 + 25 | ✓ (`python/test_webbotauth.py`) | — | — | skipped, and the skip is asserted by name |
+| `cryptobox` | ✓ `open` (with `ad`) + `mustNotOpen` + `encPub` | ✓ | — | — | skipped, and the skip is asserted by name |
 
 ## This is where the bytes live
 
