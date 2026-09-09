@@ -13,16 +13,14 @@
  * The plugin now vendors this file and adds its own `ABSPATH` guard as a recorded
  * transform. Nothing here knows about WordPress.
  *
- * WHY THIS FILE EXISTS SEPARATELY FROM WORDPRESS. Everything here is pure PHP with no
- * WordPress symbol in sight, because these are the bytes two other implementations
- * already agreed on: the JavaScript door `muretai-agent-entry.mjs` in the agent-entry
- * repository, and the Python reference `python/shared/` in agent-seam — the same bytes,
- * whose home is https://github.com/muretai/agent-seam. A third implementation earns
+ * WHY THIS FILE KNOWS NOTHING ABOUT ITS CONSUMER. Everything here is pure PHP, because
+ * these are the bytes four other implementations already agreed on: `js/seam.mjs`,
+ * `python/shared/`, `go/seam.go` and `rust/src/lib.rs`. A fifth implementation earns
  * nothing by being clever: it must produce THE SAME BYTES or the signature it makes is
- * worthless to every existing verifier. Keeping this file WordPress-free means it can be
- * tested in a bare `php -f` run against the same golden vectors the other two are held
- * to (vendored here as tests/wire_vectors.json, pinned by tests/VENDOR.json), without
- * booting a CMS.
+ * worthless to every existing verifier. Staying framework-free means it runs in a bare
+ * `php php/conformance.php` against the same golden vectors the other four are held to,
+ * without booting anything — and it means the WordPress plugin can vendor it whole and
+ * add its own guard, rather than the contract having to know a CMS exists.
  *
  * The four things that are easy to get wrong, and are therefore stated here once:
  *
@@ -601,7 +599,8 @@ final class Wire
     // DID — which is how one person's phone, laptop and watch are one customer rather than
     // three strangers. This is the third implementation of
     // shared/keybinding.verify_device_binding_v2 (Python) / `verifyDeviceBindingV2`
-    // (JavaScript), and it is byte-pinned by the vendored vectors' `bindingV2` group.
+    // (JavaScript) — Go and Rust carry no binding, so three is the whole set — and it is
+    // byte-pinned by the `bindingV2` group of this repository's own vectors.
     //
     // TWO SIGNATURES OVER THE SAME BYTES: the OWNER (root) signs, and the DEVICE
     // countersigns. The countersignature is the whole point of v2 — without it a foreign

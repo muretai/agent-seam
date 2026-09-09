@@ -61,9 +61,9 @@ function check(bool $cond, string $label, string $detail = ''): void
 }
 
 /**
- * A vendored group, read BY NAME and floored.
+ * A vector group, read BY NAME and floored.
  *
- * Every check in this file lives inside a `foreach` over a group of `tests/wire_vectors.json`,
+ * Every check in this file lives inside a `foreach` over a group of `vectors/wire_vectors.json`,
  * and a `foreach` over nothing passes. That file is not ours: it arrives by re-vendoring from
  * agent-seam, so a group can be renamed, emptied or shortened upstream without a line of this
  * plugin changing — and the suite would keep printing CONFORMANT over the cases it no longer
@@ -236,7 +236,7 @@ foreach (vectorGroup($rawDecoded, 'cardpub', 2) as $case) {
 // canonical payload must come out byte-identical to the recorded ones — a canonicaliser
 // that put one field in the wrong place could not pass it.
 
-// `isset` on a vendored group is itself a check that cannot fail: rename `bindingV2`
+// `isset` on a vector group is itself a check that cannot fail: rename `bindingV2`
 // upstream and this whole block — the account layer — disappears without a word. Say so.
 check(isset($rawDecoded->bindingV2),
     'the vectors carry the `bindingV2` group this suite walks',
@@ -321,7 +321,7 @@ if (isset($rawDecoded->bindingV2)) {
 
 // --------------------------------------------------- a P-256 OWNER root (no vectors yet)
 //
-// The vendored fixtures carry Ed25519 owners only, so this branch would otherwise ship
+// The fixtures carry Ed25519 owners only, so this branch would otherwise ship
 // unexercised. An owner root MAY be P-256: that is the whole reason the hierarchy exists —
 // a Secure Enclave / WebAuthn key is ES256 and cannot sign the Ed25519 wire itself, so it
 // signs a binding and a software device key does the day-to-day signing. The JavaScript
@@ -432,11 +432,11 @@ check(
 // DID-shaped guard inside it: `if ($group === 'did' || isset($case->did))`. It drove the
 // three `did` cases and walked SEVEN more in total silence — `cardpub` (3), `invite` (2),
 // `claim` (2) — because those cases carry `envelope` or `input` and never a bare `did`. The
-// guard was never true for any of them, in any vendored version. A group nobody drives
+// guard was never true for any of them, in any released version. A group nobody drives
 // prints exactly like a group that passes, and the generic shape made that invisible:
 // adding a group upstream added silence, not coverage.
 //
-// So the reject set is a LEDGER now. Every group the vendored file carries is named here and
+// So the reject set is a LEDGER now. Every group the vector file carries is named here and
 // accounted for — driven, or declared out of this door's reach with the reason it is out of
 // reach. A rename, an addition or a removal upstream fails the census immediately instead of
 // quietly changing what runs.
@@ -625,7 +625,7 @@ check(
 // this repository does not own, and a suite that runs NOTHING prints CONFORMANT exactly as
 // loudly as one that runs everything — `0 passed, 0 failed` is a green verdict. The group
 // floors upstream catch a group that shrinks; this catches the whole run collapsing for a
-// reason no single group would notice: a vendored file that parses to an empty object, an
+// reason no single group would notice: a vector file that parses to an empty object, an
 // early `exit` slipped into a helper, a walk accidentally nested inside a false branch.
 //
 // Only ONE branch of this file is environment-dependent — the five P-256 owner checks, which
