@@ -51,8 +51,8 @@ from pathlib import Path
 # PEER what this process is (the card's `muretai` block, presence, doctor) must read the
 # constants, never the marker. `shared/peercompat.py` is where that rule is enforced; the
 # functions below exist to answer the other question, what is on disk.
-VERSION = "0.2.54"
-RELEASE_SEQ = 59
+VERSION = "0.2.55"
+RELEASE_SEQ = 60
 CHANNEL = "beta"
 
 # The marker the updater writes into the live tree after a successful swap.
