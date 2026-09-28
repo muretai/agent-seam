@@ -103,6 +103,54 @@ final class Wire
      *  unbounded `from` field would be free CPU for a stranger. A DID is ~48 chars. */
     private const MAX_B58_LEN = 512;
 
+    /**
+     * JSON-RPC error objects by their python/shared/protocol.py names. Each entry must equal
+     * Python's constant of the same name.
+     */
+    public const ERRORS = [
+        'ROOM_MEMBER_REQUIRED' => ['code' => -32048, 'message' => 'Room member required'],
+        'ROOM_MEM_REFUSED' => ['code' => -32049, 'message' => 'Room memory refused'],
+    ];
+
+    /**
+     * Every JSON-RPC method the protocol defines -> its degradation class
+     * (python/shared/protocol.py METHOD_CLASSES): A transport, B consent-preserving loss,
+     * C consent-weakening. A method not listed is D, unknown.
+     */
+    public const METHOD_CLASSES = [
+        'message/send' => 'B',
+        'referral/request' => 'B',
+        'introduction/request' => 'B',
+        'onboard/claim' => 'B',
+        'trust/status' => 'B',
+        'connect/request' => 'B',
+        'connect/respond' => 'B',
+        'introduce/propose' => 'C',
+        'introduce/respond' => 'B',
+        'contact/redeem' => 'B',
+        'net.udp.offer' => 'A',
+        'artifact/fetch' => 'B',
+        'artifact/list' => 'B',
+        'room.mem/read' => 'B',
+        'room.mem/append' => 'B',
+        'room.kv/cas' => 'B',
+    ];
+
+    /**
+     * The degradation class of `$method`, or 'D' for a name METHOD_CLASSES does not carry.
+     * Exact, strict match: a numeric-string method would otherwise meet PHP's int-key
+     * coercion, so the key found is compared back against the name asked for.
+     */
+    public static function degradationClass(string $method): string
+    {
+        foreach (self::METHOD_CLASSES as $name => $class) {
+            if ($name === $method) {
+                return $class;
+            }
+        }
+        return 'D';
+    }
+
     // ---------------------------------------------------------------- canonical JSON
 
     /**

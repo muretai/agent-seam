@@ -30,6 +30,52 @@ import (
 	"unicode/utf8"
 )
 
+// ---------------------------------------------------------------- JSON-RPC errors and method classes
+
+// RPCError is a JSON-RPC error object: the code and the exact message a client greps for.
+type RPCError struct {
+	Code    int
+	Message string
+}
+
+// Errors carries JSON-RPC error objects by their python/shared/protocol.py names. Each entry
+// must equal Python's constant of the same name.
+var Errors = map[string]RPCError{
+	"ROOM_MEMBER_REQUIRED": {Code: -32048, Message: "Room member required"},
+	"ROOM_MEM_REFUSED":     {Code: -32049, Message: "Room memory refused"},
+}
+
+// MethodClasses maps every JSON-RPC method the protocol defines to its degradation class
+// (python/shared/protocol.py METHOD_CLASSES): A transport, B consent-preserving loss,
+// C consent-weakening. A method not listed is D, unknown.
+var MethodClasses = map[string]string{
+	"message/send":         "B",
+	"referral/request":     "B",
+	"introduction/request": "B",
+	"onboard/claim":        "B",
+	"trust/status":         "B",
+	"connect/request":      "B",
+	"connect/respond":      "B",
+	"introduce/propose":    "C",
+	"introduce/respond":    "B",
+	"contact/redeem":       "B",
+	"net.udp.offer":        "A",
+	"artifact/fetch":       "B",
+	"artifact/list":        "B",
+	"room.mem/read":        "B",
+	"room.mem/append":      "B",
+	"room.kv/cas":          "B",
+}
+
+// DegradationClass is the degradation class of method, or "D" for a name MethodClasses does
+// not carry. Exact match only: no case folding, trimming or prefix matching.
+func DegradationClass(method string) string {
+	if c, ok := MethodClasses[method]; ok {
+		return c
+	}
+	return "D"
+}
+
 // ---------------------------------------------------------------- reading the JSON
 
 // Unmarshal reads the JSON a signer or verifier is about to work on, and it deliberately

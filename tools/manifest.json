@@ -30,6 +30,8 @@
       "SIGNED_ENVELOPE_SCHEME",
       "AGENT_ENTRY_REL",
       "ERRORS",
+      "METHOD_CLASSES",
+      "degradationClass",
       "asciiLower",
       "CARD_ENVELOPE_VERSION",
       "CARD_ENVELOPE_TYPE"

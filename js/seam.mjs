@@ -53,7 +53,37 @@ export const ERRORS = {
   WRONG_RECIPIENT: { code: -32003, message: 'Message not addressed to me' },
   RATE_LIMITED: { code: -32004, message: 'Rate limited' },
   MESSAGE_TOO_LARGE: { code: -32005, message: 'Message text too large' },
+  ROOM_MEMBER_REQUIRED: { code: -32048, message: 'Room member required' },
+  ROOM_MEM_REFUSED: { code: -32049, message: 'Room memory refused' },
 };
+
+/** Every JSON-RPC method the protocol defines -> its degradation class (python/shared/protocol.py
+ *  METHOD_CLASSES): A transport, B consent-preserving loss, C consent-weakening, D unknown. */
+export const METHOD_CLASSES = Object.freeze({
+  'message/send': 'B',
+  'referral/request': 'B',
+  'introduction/request': 'B',
+  'onboard/claim': 'B',
+  'trust/status': 'B',
+  'connect/request': 'B',
+  'connect/respond': 'B',
+  'introduce/propose': 'C',
+  'introduce/respond': 'B',
+  'contact/redeem': 'B',
+  'net.udp.offer': 'A',
+  'artifact/fetch': 'B',
+  'artifact/list': 'B',
+  'room.mem/read': 'B',
+  'room.mem/append': 'B',
+  'room.kv/cas': 'B',
+});
+
+/** The degradation class of `method`, or 'D' for a name the table does not carry. An OWN key
+ *  only: `METHOD_CLASSES[m] ?? 'D'` would answer `__proto__` or `toString` with an inherited value. */
+export function degradationClass(method) {
+  return (typeof method === 'string' && Object.prototype.hasOwnProperty.call(METHOD_CLASSES, method))
+    ? METHOD_CLASSES[method] : 'D';
+}
 
 function asciiLower(s) {
   let out = '';

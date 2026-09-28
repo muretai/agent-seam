@@ -605,6 +605,12 @@ REMOTE_OPS_REFUSED = {"code": -32046, "message": "Remote ops refused"}
 # capability set (keys/account/devices.json). The remedy is a node-side grant,
 # not a different credential.
 REMOTE_OPS_VERB_DENIED = {"code": -32047, "message": "Remote ops verb denied"}
+# ---- Room API (room.mem/*, room.kv/*) ----
+# The caller is not a member of the room it addressed; room memory and the room's
+# key-value store are member-only.
+ROOM_MEMBER_REQUIRED = {"code": -32048, "message": "Room member required"}
+# The caller is a member, but the room refused this memory operation.
+ROOM_MEM_REFUSED = {"code": -32049, "message": "Room memory refused"}
 # (The -32050/-32051 pair is double-reserved elsewhere — T61 UDP vs room memory —
 # and deliberately NOT used here.)
 
@@ -664,6 +670,10 @@ METHOD_CLASSES: dict[str, str] = {
     "net.udp.offer": DEGRADE_TRANSPORT,
     "artifact/fetch": DEGRADE_LOSSY,
     "artifact/list": DEGRADE_LOSSY,
+    # Room API: member-only synchronous calls, classed as trust/status is.
+    "room.mem/read": DEGRADE_LOSSY,
+    "room.mem/append": DEGRADE_LOSSY,
+    "room.kv/cas": DEGRADE_LOSSY,
 }
 
 
