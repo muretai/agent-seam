@@ -1,0 +1,19 @@
+; The herd worker wall, macOS (Seatbelt / sandbox-exec). walls/darwin.sh renders this
+; template from the neutral profile herd-spawn.sh writes to $HERD_DIR/walls/<name>/profile:
+; each @@...@@ line below is replaced by the rules for one verb of that profile, and every
+; other line is copied as it stands. In this language a LATER rule wins over an earlier
+; one, so the order is the policy: allow everything, take every write away, give back the
+; worker's own places, take back the few paths inside them it must not write, then deny
+; the reads it must never make.
+;
+; Wall v1 permits the network. The ONE place wall v2 puts an egress policy is the last
+; marker line below (the egress marker appears once in this file and in no other file under
+; walls/); today it renders as a comment saying egress is open, and herd-spawn.sh refuses
+; HERD_WALL_EGRESS=deny until the loopback proxy that policy needs exists.
+(version 1)
+(allow default)
+(deny file-write*)
+@@ALLOW_WRITE@@
+@@DENY_WRITE@@
+@@DENY_READ@@
+@@EGRESS_POLICY@@

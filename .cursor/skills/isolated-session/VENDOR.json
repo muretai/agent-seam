@@ -1,0 +1,78 @@
+{
+  "_": "Written by .cursor/skills/isolated-session/scripts/vendor.sh pull; never edit the copies by hand. `vendor.sh check` holds them to these digests, and to the closure of what the scripts reference, with no home checkout present. The skill's home is the core trunk; edit it there and pull again.",
+  "from": "muretai-trunk",
+  "repository": "private",
+  "commit": "8b04c80fe44cbb396b837ce91e84461ace9e48b8",
+  "date": "2026-09-28",
+  "files": {
+    ".cursor/skills/isolated-session/SKILL.md": {
+      "sha256": "d373e1d07696cd01a9a8c3f92b5941c3b32750c348fe4bc62406c1728acb4b5c"
+    },
+    ".cursor/skills/isolated-session/scripts/lib.sh": {
+      "sha256": "6f59f313e64494d8212617d97d8cf47522ef01ab54bac77f7df1048293e04892"
+    },
+    ".cursor/skills/isolated-session/scripts/ensure-worktree.sh": {
+      "sha256": "f53aa9368946a4c41e5ea3cd65bafd10fcd57c03d67e8932d96fb1d4f1ac29b4"
+    },
+    ".cursor/skills/isolated-session/scripts/assert-head.sh": {
+      "sha256": "349c76c7ef7379a73879be9dbacbcc069294fd4f785d2c401ac576f18343368e"
+    },
+    ".cursor/skills/isolated-session/scripts/claim-worktree.sh": {
+      "sha256": "9c932e5d21b387ec0e626e2686284034510a57e25b73856a574581a73b892890"
+    },
+    ".cursor/skills/isolated-session/scripts/finish-worktree.sh": {
+      "sha256": "29727224480d87e2636f250d89950dea2c9de5ff597f455cfc3e239d06c00502"
+    },
+    ".cursor/skills/isolated-session/scripts/landing-lease.sh": {
+      "sha256": "360ed59710392c5c4deddcc7114f4bce2325747ecbb03d36fef0d3d87cd35acb"
+    },
+    ".cursor/skills/isolated-session/scripts/landing-lease.py": {
+      "sha256": "97fb2d9b1083813b4b4b8e91f474767d03910aeb450fbe1710e12380eafc7c43"
+    },
+    ".cursor/skills/isolated-session/scripts/lease_core.py": {
+      "sha256": "8912ff5e3b07617e17717cbaddca10713993859af26424c7260e49c9a1e2d70f"
+    },
+    ".cursor/skills/isolated-session/scripts/dispatch-init.sh": {
+      "sha256": "faf26d28ebb0914719c0f0118e678fbfa34dcf38d0ed540e76bcbce6d3a7b6f1"
+    },
+    ".cursor/skills/isolated-session/scripts/stale.sh": {
+      "sha256": "e95302630a7bdd23ccc24f6ca685f6c707e527bd8e057e589b30a558d1fe3b1b"
+    },
+    ".cursor/skills/isolated-session/scripts/session-guard.sh": {
+      "sha256": "3999050b4f36f9cd88c4acfecf8d00b908bc2133bc4781d1fde0d9298b379576"
+    },
+    ".cursor/skills/isolated-session/scripts/vendor.sh": {
+      "sha256": "773151be6706b2f7247e8d755095f8125b62d769eec2d30e08fca523d34a2189"
+    },
+    ".cursor/skills/isolated-session/scripts/herd-spawn.sh": {
+      "sha256": "05455f3c7f077654bbb1f633a8e5f5c91ceb21ca0c7c2be3c4e673b48c524e0f"
+    },
+    ".cursor/skills/isolated-session/scripts/land.sh": {
+      "sha256": "53cd1dffce7014a61720c948973975395ab8dcf38263ec3120178dd3e5619402"
+    },
+    ".cursor/skills/isolated-session/scripts/walls/darwin.sh": {
+      "sha256": "f65e7da5374b031577091fe411543d435a99e2e52673a8e52c2ac948419d66ce"
+    },
+    ".cursor/skills/isolated-session/scripts/walls/darwin.sb.template": {
+      "sha256": "71e7e4d3a6cbdac0b99c4f994b7bae620ffdde24afed1028980eb8f506a99508"
+    },
+    ".cursor/skills/isolated-session/scripts/dispatch-take.sh": {
+      "sha256": "ac5c9a2b1e7a740e14922b8b9f8d03965cccb4630721eff7e1000bb54b83a8d8"
+    },
+    ".cursor/skills/isolated-session/scripts/dispatch-capacity.sh": {
+      "sha256": "45c6d826441e086b2d2d89825989ebb66bbb68d59cad29dd234a78ff0d8aa152"
+    },
+    ".cursor/skills/isolated-session/scripts/herd-watch.sh": {
+      "sha256": "0417da067b1ed325ed179e4211d08face155f6679ad93e6bbfad47077b741755"
+    },
+    ".cursor/skills/isolated-session/briefs/worker.md": {
+      "sha256": "c5e6f72519ba5379019272ab48f521b0f45dea60fdf3cde24fcc7d2a77b60d79"
+    },
+    ".cursor/skills/isolated-session/briefs/dispatch-ticket.md": {
+      "sha256": "1128dae006789e9cde40b7751d555239840d3091a63f3f4be9d0ecb7fcaa0e51"
+    },
+    "tests/test_isolated_session.py": {
+      "sha256": "69a9d9c498b63ce2d985c97c8c817f7005f0f4a430ee9ba07899e72ba8b8be44"
+    }
+  }
+}
